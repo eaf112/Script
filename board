@@ -1,0 +1,1223 @@
+local UI = loadstring(game:HttpGet("https://raw.githubusercontent.com/eaf112/Script/refs/heads/main/ui-lib"))()
+
+local factories = {}
+factories.core = (function()
+return function()
+	local Core = {}
+	local ignored = {action = true, serverTime = true, now = true, remaining = true}
+	function Core.fingerprint(value)
+		local budget, seen = 10000, {}
+		local function encode(v, depth)
+			local kind = type(v)
+			if kind ~= "table" then
+				if kind == "number" then return "n" .. string.format("%.12g", v) end
+				if kind == "string" then return "s" .. #v .. ":" .. v end
+				return kind .. ":" .. tostring(v)
+			end
+			if depth > 14 or seen[v] then error("상태 구조가 지원 범위를 벗어났어요") end
+			seen[v] = true
+			local keys, parts = {}, {"{"}
+			for k in pairs(v) do
+				if not ignored[k] then keys[#keys + 1] = k end
+			end
+			table.sort(keys, function(a, b) return type(a) .. tostring(a) < type(b) .. tostring(b) end)
+			for _, k in ipairs(keys) do
+				budget = budget - 1
+				if budget < 0 then error("상태가 너무 커서 자동 조작을 중지했어요") end
+				parts[#parts + 1] = encode(k, depth + 1) .. "=" .. encode(v[k], depth + 1) .. ";"
+			end
+			parts[#parts + 1] = "}"
+			seen[v] = nil
+			return table.concat(parts)
+		end
+		return encode(value, 0)
+	end
+	function Core.new()
+		return {state = nil, memory = {}, sent = {}, queue = {}, enabled = true,
+			lastSent = -math.huge, received = 0, count = 0, errors = 0, epoch = 0}
+	end
+	function Core.accept(c, s, clock)
+		if type(s) ~= "table" or not s.room then return false end
+		if not s.mySeat then
+			if c.state and c.state.room == s.room then
+				c.state, c.memory, c.sent, c.queue = nil, {}, {}, {}
+				c.epoch = c.epoch + 1
+			end
+			return false
+		end
+		local previous = c.state
+		local oldGame = previous and previous.game
+		local newGame = s.game
+		local restart = not previous or previous.room ~= s.room or previous.gameId ~= s.gameId
+			or previous.mySeat ~= s.mySeat
+			or (previous.phase ~= "playing" and s.phase == "playing")
+			or (oldGame and newGame and oldGame.gameKey ~= newGame.gameKey)
+		if restart then
+			c.memory, c.sent, c.queue = {}, {}, {}
+			c.epoch = c.epoch + 1
+		end
+		local signature = Core.fingerprint({room = s.room, mySeat = s.mySeat,
+			gameId = s.gameId, phase = s.phase, game = s.game, my = s.my})
+		c.received = clock
+		if not restart and c.signature == signature and c.state then
+			c.state.action = s.action
+			return true
+		end
+		c.state, c.signature = s, signature
+		return true
+	end
+	function Core.hasSent(c)
+		return c.signature and c.sent[c.epoch .. ":" .. c.signature] == true
+	end
+	function Core.reserve(c, s, plan, clock, interval)
+		if not c.enabled or c.state ~= s or not plan or clock - c.lastSent < interval then return false end
+		local key = c.epoch .. ":" .. c.signature
+		if c.sent[key] then return false end
+		c.sent[key] = true
+		c.queue[#c.queue + 1] = key
+		if #c.queue > 512 then c.sent[table.remove(c.queue, 1)] = nil end
+		c.lastSent, c.count = clock, c.count + 1
+		return true
+	end
+	return Core
+end
+
+end)()
+factories.capitals = (function()
+return function()
+	local rows = {
+		{"🇰🇷", "대한민국|한국|South Korea", "서울"}, {"🇰🇵", "북한|North Korea", "평양"},
+		{"🇯🇵", "일본|Japan", "도쿄"}, {"🇨🇳", "중국|China", "베이징"},
+		{"🇺🇸", "미국|United States|USA", "워싱턴"}, {"🇨🇦", "캐나다|Canada", "오타와"},
+		{"🇬🇧", "영국|United Kingdom", "런던"}, {"🇫🇷", "프랑스|France", "파리"},
+		{"🇩🇪", "독일|Germany", "베를린"}, {"🇮🇹", "이탈리아|Italy", "로마"},
+		{"🇪🇸", "스페인|Spain", "마드리드"}, {"🇵🇹", "포르투갈|Portugal", "리스본"},
+		{"🇷🇺", "러시아|Russia", "모스크바"}, {"🇺🇦", "우크라이나|Ukraine", "키이우"},
+		{"🇧🇾", "벨라루스|Belarus", "민스크"}, {"🇵🇱", "폴란드|Poland", "바르샤바"},
+		{"🇨🇿", "체코|Czechia", "프라하"}, {"🇸🇰", "슬로바키아|Slovakia", "브라티슬라바"},
+		{"🇦🇹", "오스트리아|Austria", "빈"}, {"🇨🇭", "스위스|Switzerland", "베른"},
+		{"🇧🇪", "벨기에|Belgium", "브뤼셀"}, {"🇳🇱", "네덜란드|Netherlands", "암스테르담"},
+		{"🇱🇺", "룩셈부르크|Luxembourg", "룩셈부르크"}, {"🇮🇪", "아일랜드|Ireland", "더블린"},
+		{"🇳🇴", "노르웨이|Norway", "오슬로"}, {"🇸🇪", "스웨덴|Sweden", "스톡홀름"},
+		{"🇫🇮", "핀란드|Finland", "헬싱키"}, {"🇩🇰", "덴마크|Denmark", "코펜하겐"},
+		{"🇮🇸", "아이슬란드|Iceland", "레이캬비크"}, {"🇪🇪", "에스토니아|Estonia", "탈린"},
+		{"🇱🇻", "라트비아|Latvia", "리가"}, {"🇱🇹", "리투아니아|Lithuania", "빌뉴스"},
+		{"🇭🇺", "헝가리|Hungary", "부다페스트"}, {"🇷🇴", "루마니아|Romania", "부쿠레슈티"},
+		{"🇧🇬", "불가리아|Bulgaria", "소피아"}, {"🇬🇷", "그리스|Greece", "아테네"},
+		{"🇹🇷", "튀르키예|터키|Turkey|Türkiye", "앙카라"}, {"🇷🇸", "세르비아|Serbia", "베오그라드"},
+		{"🇭🇷", "크로아티아|Croatia", "자그레브"}, {"🇸🇮", "슬로베니아|Slovenia", "류블랴나"},
+		{"🇧🇦", "보스니아 헤르체고비나|Bosnia and Herzegovina", "사라예보"},
+		{"🇲🇪", "몬테네그로|Montenegro", "포드고리차"}, {"🇦🇱", "알바니아|Albania", "티라나"},
+		{"🇲🇰", "북마케도니아|North Macedonia", "스코페"}, {"🇲🇩", "몰도바|Moldova", "키시너우"},
+		{"🇲🇹", "몰타|Malta", "발레타"}, {"🇨🇾", "키프로스|Cyprus", "니코시아"},
+		{"🇲🇨", "모나코|Monaco", "모나코"}, {"🇦🇩", "안도라|Andorra", "안도라라베야"},
+		{"🇱🇮", "리히텐슈타인|Liechtenstein", "파두츠"}, {"🇸🇲", "산마리노|San Marino", "산마리노"},
+		{"🇻🇦", "바티칸|Vatican City", "바티칸"}, {"🇬🇪", "조지아|Georgia", "트빌리시"},
+		{"🇦🇲", "아르메니아|Armenia", "예레반"}, {"🇦🇿", "아제르바이잔|Azerbaijan", "바쿠"},
+		{"🇲🇳", "몽골|Mongolia", "울란바토르"}, {"🇹🇼", "대만|Taiwan", "타이베이"},
+		{"🇻🇳", "베트남|Vietnam", "하노이"}, {"🇹🇭", "태국|Thailand", "방콕"},
+		{"🇱🇦", "라오스|Laos", "비엔티안"}, {"🇰🇭", "캄보디아|Cambodia", "프놈펜"},
+		{"🇲🇲", "미얀마|Myanmar", "네피도"}, {"🇲🇾", "말레이시아|Malaysia", "쿠알라룸푸르"},
+		{"🇸🇬", "싱가포르|Singapore", "싱가포르"}, {"🇮🇩", "인도네시아|Indonesia", "자카르타"},
+		{"🇵🇭", "필리핀|Philippines", "마닐라"}, {"🇧🇳", "브루나이|Brunei", "반다르스리브가완"},
+		{"🇹🇱", "동티모르|Timor-Leste", "딜리"}, {"🇮🇳", "인도|India", "뉴델리"},
+		{"🇵🇰", "파키스탄|Pakistan", "이슬라마바드"}, {"🇧🇩", "방글라데시|Bangladesh", "다카"},
+		{"🇳🇵", "네팔|Nepal", "카트만두"}, {"🇧🇹", "부탄|Bhutan", "팀부"},
+		{"🇱🇰", "스리랑카|Sri Lanka", "스리자야와르데네푸라코테"}, {"🇲🇻", "몰디브|Maldives", "말레"},
+		{"🇦🇫", "아프가니스탄|Afghanistan", "카불"}, {"🇮🇷", "이란|Iran", "테헤란"},
+		{"🇮🇶", "이라크|Iraq", "바그다드"}, {"🇸🇦", "사우디아라비아|Saudi Arabia", "리야드"},
+		{"🇦🇪", "아랍에미리트|United Arab Emirates", "아부다비"}, {"🇶🇦", "카타르|Qatar", "도하"},
+		{"🇰🇼", "쿠웨이트|Kuwait", "쿠웨이트"}, {"🇧🇭", "바레인|Bahrain", "마나마"},
+		{"🇴🇲", "오만|Oman", "무스카트"}, {"🇾🇪", "예멘|Yemen", "사나"},
+		{"🇸🇾", "시리아|Syria", "다마스쿠스"}, {"🇱🇧", "레바논|Lebanon", "베이루트"},
+		{"🇯🇴", "요르단|Jordan", "암만"}, {"🇮🇱", "이스라엘|Israel", "예루살렘"},
+		{"🇵🇸", "팔레스타인|Palestine", "동예루살렘"}, {"🇰🇿", "카자흐스탄|Kazakhstan", "아스타나"},
+		{"🇺🇿", "우즈베키스탄|Uzbekistan", "타슈켄트"}, {"🇰🇬", "키르기스스탄|Kyrgyzstan", "비슈케크"},
+		{"🇹🇯", "타지키스탄|Tajikistan", "두샨베"}, {"🇹🇲", "투르크메니스탄|Turkmenistan", "아시가바트"},
+		{"🇦🇺", "호주|오스트레일리아|Australia", "캔버라"}, {"🇳🇿", "뉴질랜드|New Zealand", "웰링턴"},
+		{"🇵🇬", "파푸아뉴기니|Papua New Guinea", "포트모르즈비"}, {"🇫🇯", "피지|Fiji", "수바"},
+		{"🇸🇧", "솔로몬 제도|Solomon Islands", "호니아라"}, {"🇻🇺", "바누아투|Vanuatu", "포트빌라"},
+		{"🇼🇸", "사모아|Samoa", "아피아"}, {"🇹🇴", "통가|Tonga", "누쿠알로파"},
+		{"🇹🇻", "투발루|Tuvalu", "푸나푸티"}, {"🇰🇮", "키리바시|Kiribati", "사우스타라와"},
+		{"🇲🇭", "마셜 제도|Marshall Islands", "마주로"}, {"🇫🇲", "미크로네시아|Micronesia", "팔리키르"},
+		{"🇵🇼", "팔라우|Palau", "응게룰무드"}, {"🇳🇷", "나우루|Nauru", "야렌"},
+		{"🇲🇽", "멕시코|Mexico", "멕시코시티"}, {"🇬🇹", "과테말라|Guatemala", "과테말라시티"},
+		{"🇧🇿", "벨리즈|Belize", "벨모판"}, {"🇭🇳", "온두라스|Honduras", "테구시갈파"},
+		{"🇸🇻", "엘살바도르|El Salvador", "산살바도르"}, {"🇳🇮", "니카라과|Nicaragua", "마나과"},
+		{"🇨🇷", "코스타리카|Costa Rica", "산호세"}, {"🇵🇦", "파나마|Panama", "파나마시티"},
+		{"🇨🇺", "쿠바|Cuba", "아바나"}, {"🇭🇹", "아이티|Haiti", "포르토프랭스"},
+		{"🇩🇴", "도미니카 공화국|Dominican Republic", "산토도밍고"}, {"🇯🇲", "자메이카|Jamaica", "킹스턴"},
+		{"🇧🇸", "바하마|Bahamas", "나소"}, {"🇧🇧", "바베이도스|Barbados", "브리지타운"},
+		{"🇹🇹", "트리니다드 토바고|Trinidad and Tobago", "포트오브스페인"},
+		{"🇩🇲", "도미니카 연방|Dominica", "로조"}, {"🇬🇩", "그레나다|Grenada", "세인트조지스"},
+		{"🇦🇬", "앤티가 바부다|Antigua and Barbuda", "세인트존스"},
+		{"🇰🇳", "세인트키츠 네비스|Saint Kitts and Nevis", "바스테르"},
+		{"🇱🇨", "세인트루시아|Saint Lucia", "캐스트리스"},
+		{"🇻🇨", "세인트빈센트 그레나딘|Saint Vincent and the Grenadines", "킹스타운"},
+		{"🇧🇷", "브라질|Brazil", "브라질리아"}, {"🇦🇷", "아르헨티나|Argentina", "부에노스아이레스"},
+		{"🇨🇱", "칠레|Chile", "산티아고"}, {"🇵🇪", "페루|Peru", "리마"},
+		{"🇧🇴", "볼리비아|Bolivia", "수크레"}, {"🇵🇾", "파라과이|Paraguay", "아순시온"},
+		{"🇺🇾", "우루과이|Uruguay", "몬테비데오"}, {"🇪🇨", "에콰도르|Ecuador", "키토"},
+		{"🇨🇴", "콜롬비아|Colombia", "보고타"}, {"🇻🇪", "베네수엘라|Venezuela", "카라카스"},
+		{"🇬🇾", "가이아나|Guyana", "조지타운"}, {"🇸🇷", "수리남|Suriname", "파라마리보"},
+		{"🇪🇬", "이집트|Egypt", "카이로"}, {"🇱🇾", "리비아|Libya", "트리폴리"},
+		{"🇹🇳", "튀니지|Tunisia", "튀니스"}, {"🇩🇿", "알제리|Algeria", "알제"},
+		{"🇲🇦", "모로코|Morocco", "라바트"}, {"🇸🇩", "수단|Sudan", "하르툼"},
+		{"🇸🇸", "남수단|South Sudan", "주바"}, {"🇪🇹", "에티오피아|Ethiopia", "아디스아바바"},
+		{"🇪🇷", "에리트레아|Eritrea", "아스마라"}, {"🇩🇯", "지부티|Djibouti", "지부티"},
+		{"🇸🇴", "소말리아|Somalia", "모가디슈"}, {"🇰🇪", "케냐|Kenya", "나이로비"},
+		{"🇺🇬", "우간다|Uganda", "캄팔라"}, {"🇹🇿", "탄자니아|Tanzania", "도도마"},
+		{"🇷🇼", "르완다|Rwanda", "키갈리"}, {"🇧🇮", "부룬디|Burundi", "기테가"},
+		{"🇨🇩", "콩고 민주 공화국|DR Congo", "킨샤사"}, {"🇨🇬", "콩고 공화국|Congo", "브라자빌"},
+		{"🇨🇫", "중앙아프리카 공화국|Central African Republic", "방기"}, {"🇹🇩", "차드|Chad", "은자메나"},
+		{"🇨🇲", "카메룬|Cameroon", "야운데"}, {"🇬🇶", "적도 기니|Equatorial Guinea", "말라보"},
+		{"🇬🇦", "가봉|Gabon", "리브르빌"}, {"🇸🇹", "상투메 프린시페|São Tomé and Príncipe", "상투메"},
+		{"🇳🇬", "나이지리아|Nigeria", "아부자"}, {"🇳🇪", "니제르|Niger", "니아메"},
+		{"🇧🇯", "베냉|Benin", "포르토노보"}, {"🇹🇬", "토고|Togo", "로메"},
+		{"🇬🇭", "가나|Ghana", "아크라"}, {"🇨🇮", "코트디부아르|Ivory Coast", "야무수크로"},
+		{"🇧🇫", "부르키나파소|Burkina Faso", "와가두구"}, {"🇲🇱", "말리|Mali", "바마코"},
+		{"🇲🇷", "모리타니|Mauritania", "누악쇼트"}, {"🇸🇳", "세네갈|Senegal", "다카르"},
+		{"🇬🇲", "감비아|Gambia", "반줄"}, {"🇬🇼", "기니비사우|Guinea-Bissau", "비사우"},
+		{"🇬🇳", "기니|Guinea", "코나크리"}, {"🇸🇱", "시에라리온|Sierra Leone", "프리타운"},
+		{"🇱🇷", "라이베리아|Liberia", "몬로비아"}, {"🇨🇻", "카보베르데|Cape Verde", "프라이아"},
+		{"🇦🇴", "앙골라|Angola", "루안다"}, {"🇿🇲", "잠비아|Zambia", "루사카"},
+		{"🇿🇼", "짐바브웨|Zimbabwe", "하라레"}, {"🇲🇼", "말라위|Malawi", "릴롱궤"},
+		{"🇲🇿", "모잠비크|Mozambique", "마푸투"}, {"🇳🇦", "나미비아|Namibia", "빈트후크"},
+		{"🇧🇼", "보츠와나|Botswana", "가보로네"}, {"🇿🇦", "남아프리카 공화국|남아공|South Africa", "프리토리아"},
+		{"🇱🇸", "레소토|Lesotho", "마세루"}, {"🇸🇿", "에스와티니|Eswatini", "음바바네"},
+		{"🇲🇬", "마다가스카르|Madagascar", "안타나나리보"}, {"🇲🇺", "모리셔스|Mauritius", "포트루이스"},
+		{"🇸🇨", "세이셸|Seychelles", "빅토리아"}, {"🇰🇲", "코모로|Comoros", "모로니"}
+	}
+	local out = {}
+	for _, row in ipairs(rows) do
+		out[row[1]] = row[3]
+		for name in row[2]:gmatch("[^|]+") do out[name:lower():gsub("%s", "")] = row[3] end
+	end
+	return out
+end
+
+end)()
+factories.strategies = (function()
+return function(env)
+	local P, data = {}, env.data
+	local unpackArgs = table.unpack or unpack
+	local function action(name, ...)
+		return {action = name, args = {n = select("#", ...), ...}}
+	end
+	local function own(s) return s.game.seats and s.game.seats[s.mySeat] end
+	local function turn(s, phase) return s.game.turn == s.mySeat and (not phase or s.game.phase == phase) end
+	local function contains(t, v)
+		for _, x in pairs(t or {}) do if x == v then return true end end
+		return false
+	end
+	local function copy(t)
+		local out = {}
+		for k, v in pairs(t or {}) do out[k] = v end
+		return out
+	end
+	local function pick(t, score)
+		local best, value = nil, -math.huge
+		for _, x in ipairs(t or {}) do
+			local n = score(x)
+			if n > value then best, value = x, n end
+		end
+		return best
+	end
+	local function randomChoice(t, mem, key)
+		if #t == 0 then return nil end
+		if not mem.random or mem.random.key ~= key then
+			mem.random = {key = key, value = t[math.random(1, #t)]}
+		end
+		return mem.random.value
+	end
+	local function token(g)
+		return table.concat({tostring(g.phase), tostring(g.round), tostring(g.turn),
+			tostring(g.phaseEndsAt), tostring(g.turnEndsAt), tostring(g.turnCount)}, ":")
+	end
+	function P.OneCard(s)
+		local g, me, hand, d = s.game, own(s), (s.my or {}).hand or {}, data("OneCardData")
+		if not me.rang then
+			for _, player in pairs(g.seats) do
+				if type(player) == "table" and player.count == 1 and not player.declared then return action("Bell") end
+			end
+		end
+		if not turn(s) then return end
+		local colors = {}
+		for _, c in ipairs(hand) do colors[c.c] = (colors[c.c] or 0) + 1 end
+		local card = pick(hand, function(c)
+			if not d.CanPlay(c, g.top, g.color, g.pending) then return -math.huge end
+			return (colors[c.c] or 0) * 2 + (c.v == "+2" and 5 or 0)
+				+ ((c.v == "J" or c.v == "U") and 3 or 0) - (c.c == "Wild" and 15 or 0)
+		end)
+		if not card then return action("Draw") end
+		if card.c == "Wild" then
+			local color = pick(d.ColorOrder, function(c) return colors[c] or 0 end)
+			return action("Play", card.id, color)
+		end
+		return action("Play", card.id)
+	end
+	function P.HolyMoly(s, mem, now)
+		local g, totals, d = s.game, {}, data("HolyMolyData")
+		for _, player in pairs(g.seats) do
+			if type(player) == "table" and player.top and (player.up or 0) > 0 then
+				local c = player.top
+				totals[c.f] = (totals[c.f] or 0) + c.n
+			end
+		end
+		for _, n in pairs(totals) do if n == d.Config.Target then return action("Bell") end end
+		if turn(s) and now >= (g.flipReadyAt or 0) and now >= (g.turnStartsAt or 0) then return action("Flip") end
+	end
+	P.HalliGalli = P.HolyMoly
+	function P.MemoryEmoji(s, mem)
+		local g, me = s.game, own(s)
+		if g.phase == "vote" then if not me.vote then return action("Vote", 1) end return end
+		mem.faces = mem.faces or {}
+		local available, opened = {}, nil
+		for i, tile in ipairs(g.tiles or {}) do
+			if tile.s == "o" or tile.s == "c" then mem.faces[i] = tile.f end
+			if tile.s == "o" then opened = i end
+			if tile.s ~= "o" and tile.s ~= "c" then available[#available + 1] = i end
+		end
+		if not turn(s) or (g.phase ~= "pick1" and g.phase ~= "pick2") then return end
+		if opened then
+			for _, i in ipairs(available) do
+				if mem.faces[i] and mem.faces[i] == mem.faces[opened] then return action("Flip", i) end
+			end
+		else
+			for a = 1, #available do
+				for b = a + 1, #available do
+					local i, j = available[a], available[b]
+					if mem.faces[i] and mem.faces[i] == mem.faces[j] then return action("Flip", i) end
+				end
+			end
+		end
+		for _, i in ipairs(available) do if not mem.faces[i] then return action("Flip", i) end end
+		if available[1] then return action("Flip", available[1]) end
+	end
+	P.MemoryRoblox = P.MemoryEmoji
+	function P.MysteryCode(s, mem)
+		local g, my, d = s.game, s.my or {}, data("MysteryCodeData")
+		if not turn(s) then return end
+		if g.phase == "draw" then
+			for i, tile in pairs(g.pool or {}) do if tile then return action("Draw", i) end end
+		elseif g.phase == "place" and my.drawn then
+			for gap = 0, #(my.tiles or {}) do
+				if d.ValidPlace(my.tiles or {}, my.drawn, gap) then return action("Place", gap) end
+			end
+		elseif g.phase == "reveal" then
+			for _, tile in ipairs(my.tiles or {}) do if not tile.r then return action("Reveal", tile.id) end end
+		elseif g.phase == "guess" or g.phase == "decide" then
+			mem.failed = mem.failed or {}
+			local last = s.action
+			if last and last.kind == "miss" and last.id and last.n ~= nil then
+				mem.failed[last.id] = mem.failed[last.id] or {}
+				mem.failed[last.id][last.n] = true
+			end
+			local used = {B = {}, W = {}}
+			for seat, player in pairs(g.seats) do
+				local tiles = seat == s.mySeat and my.tiles or (type(player) == "table" and player.tiles or {})
+				for _, t in ipairs(tiles or {}) do if t.n ~= nil and used[t.c] then used[t.c][t.n] = true end end
+			end
+			if my.drawn and used[my.drawn.c] then used[my.drawn.c][my.drawn.n] = true end
+			local best, count = nil, math.huge
+			for seat, player in pairs(g.seats) do
+				if seat ~= s.mySeat and type(player) == "table" and not player.out then
+					for pos, tile in ipairs(player.tiles or {}) do
+						if not tile.r and tile.n == nil and used[tile.c] then
+							local lo, hi, choices = -1, 24, {}
+							for j, t in ipairs(player.tiles) do
+								if t.n ~= nil and t.n ~= d.JOKER then
+									local key = t.n * 2 + (t.c == "B" and 0 or 1)
+									if j < pos then lo = math.max(lo, key) elseif j > pos then hi = math.min(hi, key) end
+								end
+							end
+							for n = 0, d.Config.MaxNumber do
+								local key = n * 2 + (tile.c == "B" and 0 or 1)
+								if key > lo and key < hi and not used[tile.c][n] and not (mem.failed[tile.id] or {})[n] then
+									choices[#choices + 1] = n
+								end
+							end
+							if not used[tile.c][d.JOKER] and not (mem.failed[tile.id] or {})[d.JOKER] then choices[#choices + 1] = d.JOKER end
+							if #choices > 0 and #choices < count then
+								best, count = {seat, tile.id, choices[math.ceil(#choices / 2)]}, #choices
+							end
+						end
+					end
+				end
+			end
+			if g.phase == "decide" and count > 2 then return action("Stop") end
+			if best then return action("Guess", unpackArgs(best)) end
+			if g.phase == "decide" then return action("Stop") end
+		end
+	end
+	function P.Cubitile(s)
+		if not turn(s) then return end
+		local d, rack, me = data("CubitileData"), copy((s.my or {}).rack), own(s)
+		local sets, used, candidates = {}, {}, {}
+		for _, set in ipairs(s.game.sets or {}) do sets[#sets + 1] = copy(set) end
+		local function add(tiles)
+			local ok, points, _, sorted = d.Analyze(tiles)
+			if ok then candidates[#candidates + 1] = {tiles = sorted or tiles, points = points} end
+		end
+		local jokers = {}
+		for _, tile in ipairs(rack) do if tile.j then jokers[#jokers + 1] = tile end end
+		for _, color in ipairs(d.ColorOrder) do
+			for start = 1, d.Config.MaxNumber - 2 do
+				local run, joker = {}, 1
+				for n = start, d.Config.MaxNumber do
+					local found
+					for _, t in ipairs(rack) do if not t.j and t.c == color and t.n == n then found = t break end end
+					if not found then found, joker = jokers[joker], joker + 1 end
+					if not found then break end
+					run[#run + 1] = found
+					if #run >= 3 then add(copy(run)) end
+				end
+			end
+		end
+		for n = 1, d.Config.MaxNumber do
+			local byColor, group = {}, {}
+			for _, t in ipairs(rack) do
+				if not t.j and t.n == n and not byColor[t.c] then byColor[t.c], group[#group + 1] = true, t end
+			end
+			for _, t in ipairs(jokers) do if #group < 4 then group[#group + 1] = t end end
+			if #group >= 3 then add(copy(group)) end
+			if #group == 4 then
+				for omit = 1, 4 do
+					local three = {}
+					for i, t in ipairs(group) do if i ~= omit then three[#three + 1] = t end end
+					add(three)
+				end
+			end
+		end
+		table.sort(candidates, function(a, b) return #a.tiles * 100 + a.points > #b.tiles * 100 + b.points end)
+		local chosen, points = {}, 0
+		for _, set in ipairs(candidates) do
+			local free = true
+			for _, t in ipairs(set.tiles) do if used[t.id] then free = false end end
+			if free then
+				chosen[#chosen + 1], points = set.tiles, points + set.points
+				for _, t in ipairs(set.tiles) do used[t.id] = true end
+			end
+		end
+		if not me.melded and points < d.Config.InitialMeld then return action("Draw") end
+		for _, set in ipairs(chosen) do sets[#sets + 1] = set end
+		if me.melded then
+			for _, tile in ipairs(rack) do
+				if not used[tile.id] then
+					for i, set in ipairs(sets) do
+						local trial = copy(set)
+						trial[#trial + 1] = tile
+						local ok, _, _, sorted = d.Analyze(trial)
+						if ok then sets[i], used[tile.id] = sorted or trial, true break end
+					end
+				end
+			end
+		end
+		if not next(used) then return action("Draw") end
+		local ids = {}
+		for _, set in ipairs(sets) do
+			local row = {}
+			for _, tile in ipairs(set) do row[#row + 1] = tile.id end
+			ids[#ids + 1] = row
+		end
+		return action("Submit", ids)
+	end
+	function P.KoreaMarble(s)
+		local g, me = s.game, own(s)
+		if g.phase == "mode" then
+			if not (g.modeVotes or {})[tostring(s.mySeat)] then return action("Mode", 1) end
+			return
+		end
+		if not turn(s) then return end
+		if g.phase == "roll" then return action("Roll") end
+		local p = g.pending
+		if g.phase == "buy" and p then return action("Buy", (me.money or 0) >= p.price * 1.25) end
+		if g.phase == "build" and p then
+			local level = 0
+			for _, option in ipairs(p.options or {}) do
+				if option.cost <= (me.money or 0) * 0.5 then level = math.max(level, option.level) end
+			end
+			return action("Build", level)
+		end
+		if g.phase == "fly" then
+			local d, best, value = data("KoreaMarbleData"), nil, -math.huge
+			for i, tile in ipairs(g.tiles or {}) do
+				local pos = i - 1
+				if pos ~= d.AIRPORT then
+					local spec = d.Tile(pos)
+					local score = tile.o == s.mySeat and 25 or (tile.o == 0 and 10 or -10)
+					if spec and spec.kind == "city" then score = score + 5 end
+					if pos < d.AIRPORT then score = score + 2 end
+					if score > value then best, value = pos, score end
+				end
+			end
+			if best then return action("Fly", best) end
+		end
+	end
+	function P.BaconBreak(s)
+		if not turn(s, "play") then return end
+		local g, d = s.game, data("BaconBreakData")
+		local board, best, value = d.Board(g.R), nil, -math.huge
+		for i, cell in ipairs(board.cells) do
+			if g.alive[i] and i ~= board.center then
+				local x, z = d.CellXZ(cell)
+				local alive = d.CopyAlive(g.alive)
+				local fallen = d.Simulate(g.R, alive, d.HitCells(g.R, alive, x, z))
+				if alive[board.center] then
+					local score = -#fallen * 10 + math.abs(cell[1]) + math.abs(cell[2])
+					if score > value then best, value = {x, z}, score end
+				end
+			end
+		end
+		if not best then
+			for i, cell in ipairs(board.cells) do if g.alive[i] then best = {d.CellXZ(cell)} break end end
+		end
+		if best then return action("Hit", best[1], best[2]) end
+	end
+	function P.Ppega(s, mem, now)
+		if not turn(s) then return end
+		local g, d = s.game, data("JengaData")
+		if g.phase == "pick" then
+			local best, value = nil, -math.huge
+			for l, row in ipairs(g.tower or {}) do
+				for k = 1, 3 do
+					if d.Removable(g.tower, l, k) then
+						local trial = d.Copy(g.tower)
+						trial[l][k] = false
+						if not d.Broken(trial[l]) then
+							local score = d.ZoneFor(g.tower, l, k) - d.Wobble(trial) * 0.02
+							if score > value then best, value = {l, k}, score end
+						end
+					end
+				end
+			end
+			if best then return action("Pick", best[1], best[2]) end
+		elseif g.phase == "pull" and g.pick and g.zone then
+			local needle = d.Needle(now - (g.pullStart or now))
+			if math.abs(needle - g.zone.c) <= math.max(0.015, g.zone.w * 0.22) then return action("Pull", needle) end
+		end
+	end
+	function P.Sugarlander(s)
+		if not turn(s) then return end
+		local g, me, d = s.game, own(s), data("SugarlanderData")
+		local tokens, bonus, cards = me.tokens or {}, me.bonus or {}, {}
+		for _, row in ipairs(g.board or {}) do for _, c in ipairs(row) do if c then cards[#cards + 1] = c end end end
+		for _, c in ipairs((s.my or {}).reserved or {}) do cards[#cards + 1] = c end
+		local function distance(c)
+			local missing = 0
+			for _, color in ipairs(d.COLORS) do missing = missing + math.max(0, (c.cost[color] or 0) - (bonus[color] or 0) - (tokens[color] or 0)) end
+			return math.max(0, missing - (tokens[d.GOLD] or 0))
+		end
+		local target = pick(cards, function(c) return (c.pts or 0) * 2 + 3 - distance(c) * 3 end)
+		if g.phase == "discard" then
+			local color = pick(d.ALL, function(c)
+				if (tokens[c] or 0) == 0 then return -math.huge end
+				return (tokens[c] or 0) - (target and (target.cost[c] or 0) or 0) - (c == d.GOLD and 10 or 0)
+			end)
+			if color then return action("Return", color) end
+		elseif g.phase == "turn" then
+			local buy = pick(cards, function(c)
+				if not d.Payment(c, tokens, bonus) then return -math.huge end
+				return (c.pts or 0) * 5 + 4 - (c.lvl or 1) * 0.1
+			end)
+			if buy then return action("Buy", buy.id) end
+			local colors = copy(d.COLORS)
+			table.sort(colors, function(a, b)
+				local function need(c) return (target and (target.cost[c] or 0) or 0) - (bonus[c] or 0) - (tokens[c] or 0) end
+				return need(a) > need(b)
+			end)
+			local take = {}
+			for _, c in ipairs(colors) do if (g.bank[c] or 0) > 0 and #take < 3 then take[#take + 1] = c end end
+			if d.ValidTake(take, g.bank) then return action("Take", take) end
+			for _, c in ipairs(colors) do if d.ValidTake({c, c}, g.bank) then return action("Take", {c, c}) end end
+			if (me.reserved or 0) < d.Config.MaxReserved then
+				for _, row in ipairs(g.board or {}) do if row[1] then return action("Reserve", row[1].id) end end
+			end
+		end
+	end
+	function P.Robble(s, mem, now)
+		local g, me, d = s.game, own(s), data("RobbleData")
+		if g.phase == "vote" then if not me.vote then return action("Vote", 1) end return end
+		if g.phase ~= "play" or (me.lock or 0) > now then return end
+		local spec = d.Modes[g.mode]
+		if not spec then return end
+		local mode, top = spec.Id, me.top
+		local function match(a, b, at)
+			if a and b then
+				local sym = d.Common(a.s, b.s)
+				if sym then return action("Claim", {sym = sym, at = at}) end
+			end
+		end
+		if mode == "tower" or mode == "well" then return match(top, g.center, "c") end
+		if mode == "catch" then
+			for i, card in ipairs(g.ring or {}) do local plan = match(g.center, card, "r" .. i) if plan then return plan end end
+		else
+			for seat, player in pairs(g.seats) do
+				if seat ~= s.mySeat and type(player) == "table" and not player.out then
+					local plan = match(mode == "potato" and top or g.center, player.top, "s" .. seat)
+					if plan then return plan end
+				end
+			end
+		end
+	end
+	P.RobbleRoblox, P.RobbleBrainrot = P.Robble, P.Robble
+	function P.NewbieRoulette(s, mem)
+		if not turn(s, "pick") then return end
+		local holes = {}
+		for i, n in ipairs(s.game.holes or {}) do if n == 0 then holes[#holes + 1] = i end end
+		local hole = randomChoice(holes, mem, token(s.game))
+		if hole then return action("Stab", hole, s.game.yaw or 0) end
+	end
+	function P.SkewerMaster(s, mem, now)
+		local g, me, d = s.game, own(s), data("SkewerData")
+		if g.phase ~= "play" or (me.lock or 0) > now or not g.menu then return end
+		local skewer, menu = me.skewer or {}, g.menu.items or {}
+		for i, item in ipairs(skewer) do
+			if not menu[i] or menu[i].t ~= item.t then return action("Pop") end
+		end
+		for i, item in ipairs(skewer) do
+			if item.r % d.Faces(item.t) ~= menu[i].r % d.Faces(item.t) then return action("Rotate", i) end
+		end
+		if d.Matches(skewer, menu) then return action("Serve") end
+		local nextItem = menu[#skewer + 1]
+		if nextItem then
+			for _, player in pairs(g.seats) do
+				for _, item in ipairs(type(player) == "table" and player.pool or {}) do
+					if item.t == nextItem.t then return action("Take", item.id) end
+				end
+			end
+		end
+	end
+	function P.Omok(s)
+		if not turn(s, "play") then return end
+		local d, g, me = data("OmokData"), s.game, own(s)
+		local move = d.bestMove(g.board, me.color)
+		if move and g.board[move] == 0 and (me.color ~= 1 or not d.forbidden(g.board, move)) then return action("Place", move) end
+	end
+	function P.Chess(s)
+		local g, me, d = s.game, own(s), data("ChessData")
+		if not turn(s, "play") or not g.pos or g.pos.turn ~= me.color then return end
+		local legal = d.legalMoves(g.pos)
+		local move = d.bestMove(g.pos, env.chessDepth or 3)
+		if move then
+			for _, valid in ipairs(legal) do
+				if valid.f == move.f and valid.t == move.t and valid.p == move.p then return action("Move", move.f, move.t, move.p) end
+			end
+		end
+	end
+	function P.LaCucaracha(s)
+		if not turn(s, "pick") then return end
+		local g, me, d = s.game, own(s), data("CucarachaData")
+		local gates, enemies = {}, {}
+		for _, player in pairs(g.seats) do
+			if type(player) == "table" and player.side and not player.out then
+				gates[player.side] = true
+				if player.side ~= me.side then enemies[#enemies + 1] = player.side end
+			end
+		end
+		local roach = g.roach
+		if not roach or roach.hidden then return end
+		local best = d.bestSpin(copy(g.walls), gates, roach.to or roach.k, me.side, enemies, function(i)
+			return g.die == "S" or d.Spinners[i][3] == g.die
+		end)
+		if best then return action("Spin", best) end
+	end
+	function P.CapitalQuiz(s, mem)
+		local g, me = s.game, own(s)
+		mem.capitals = mem.capitals or {}
+		if g.phase == "reveal" and g.capital then
+			mem.capitals[g.country or ""] = g.capital
+			mem.capitals[g.flag or ""] = g.capital
+		end
+		if g.phase ~= "ask" or me.sent then return end
+		local answer = mem.capitals[g.country] or mem.capitals[g.flag]
+			or env.capitals[g.flag] or env.capitals[(g.country or ""):lower():gsub("%s", "")]
+		if answer then return action("Answer", answer) end
+		return action("Pass")
+	end
+	local function rps(s, mem)
+		local g, my = s.game, s.my or {}
+		if my.pick or own(s).picked then return end
+		local options = {"R", "P", "S"}
+		return action("Pick", randomChoice(options, mem, token(g)))
+	end
+	function P.HammerRPS(s, mem, now)
+		local g = s.game
+		if g.phase == "choose" then return rps(s, mem) end
+		if g.phase == "duel" and g.cueAt and now >= g.cueAt + 0.13 then
+			if mem.reactRound == g.round then return end
+			if g.winner == s.mySeat or g.loser == s.mySeat then
+				return action("React", g.winner == s.mySeat and "hammer" or "basin", now - g.cueAt)
+			end
+		end
+	end
+	function P.MukJjiPpa(s, mem)
+		if s.game.phase == "pick" then return rps(s, mem) end
+	end
+	function P.CrocDentist(s, mem)
+		if not turn(s, "pick") then return end
+		local options = {}
+		for i, n in ipairs(s.game.teeth or {}) do if n == 0 then options[#options + 1] = i end end
+		local tooth = randomChoice(options, mem, token(s.game))
+		if tooth then return action("Press", tooth) end
+	end
+	function P.ThreeSixNine(s)
+		if not turn(s, "say") then return end
+		local n, d = s.game.num, data("TSNData")
+		if n then
+			if d.claps(n) > 0 then return action("Clap") end
+			return action("Say", n)
+		end
+	end
+	function P.BombTrial(s, mem, now)
+		local g = s.game
+		if g.phase == "live" and g.holder == s.mySeat and now >= (g.lockUntil or 0) then
+			local options = {}
+			for _, seat in ipairs({g.left, g.right}) do
+				if seat and seat ~= s.mySeat and not contains(options, seat) then options[#options + 1] = seat end
+			end
+			local seat = randomChoice(options, mem, token(g) .. ":" .. tostring(g.lockUntil))
+			if seat then return action("Pass", seat) end
+		end
+	end
+	function P.ThankYouNext(s)
+		if not turn(s, "pick") then return end
+		local g, me, d = s.game, own(s), data("ThankYouData")
+		if not g.card then return end
+		if (me.chips or 0) == 0 then return action("Take") end
+		local before = d.Score(me.cards or {}, me.chips or 0)
+		local cards = copy(me.cards)
+		cards[#cards + 1] = g.card
+		local after = d.Score(cards, (me.chips or 0) + (g.pot or 0))
+		if after - before <= math.max(1, 6 - (me.chips or 0) * 0.3) then return action("Take") end
+		return action("Pass")
+	end
+	function P.MafiaClassic(s, mem)
+		local g, my, me = s.game, s.my or {}, own(s)
+		if not me.alive then return end
+		local choices = {}
+		for seat, player in pairs(g.seats) do
+			if type(player) == "table" and player.alive and seat ~= s.mySeat then choices[#choices + 1] = seat end
+		end
+		table.sort(choices)
+		local function checked(seat)
+			local checks = my.checks or {}
+			if checks[seat] ~= nil then return checks[seat] end
+			return checks[tostring(seat)]
+		end
+		if g.phase == "vote" then
+			if my.voteFor then return end
+			local suspect = pick(choices, function(seat)
+				local role = checked(seat)
+				if my.role == "Mafia" and contains(my.mates, seat) then return -math.huge end
+				if role == false then return -math.huge end
+				return (role == true and 1000 or 0) + (g.seats[seat].votes or 0) * 3
+			end)
+			return action("Vote", suspect or 0)
+		elseif g.phase == "night" then
+			if my.pick or my.target then return end
+			if my.role == "Doctor" then return action("Pick", s.mySeat) end
+			if my.role == "Mafia" then
+				local victim = pick(choices, function(seat)
+					if contains(my.mates, seat) then return -math.huge end
+					return g.seats[seat].role == "Police" and 10 or 1
+				end)
+				if victim then return action("Pick", victim) end
+			elseif my.role == "Police" then
+				for _, seat in ipairs(choices) do if checked(seat) == nil then return action("Pick", seat) end end
+			end
+		end
+	end
+	function P.ThiefCat(s, mem)
+		local g = s.game
+		if not turn(s, "turn") then return end
+		local target = (g.seats or {})[g.target]
+		if target and (target.count or 0) > 0 then
+			local choices = {}
+			for i = 1, target.count do choices[i] = i end
+			return action("Pick", randomChoice(choices, mem, token(g)))
+		end
+	end
+	function P.IndianCard(s)
+		local g, my, me = s.game, s.my or {}, own(s)
+		if g.phase ~= "decide" or not me.inRound or my.choice then return end
+		local counts, highest = {}, 0
+		for n = 1, 10 do counts[n] = 2 end
+		for seat, player in pairs(g.seats) do
+			if seat ~= s.mySeat and type(player) == "table" and player.inRound and not player.out then
+				local n = (my.others or {})[seat] or (my.others or {})[tostring(seat)] or player.card
+				if type(n) == "number" and counts[n] then
+					counts[n], highest = math.max(0, counts[n] - 1), math.max(highest, n)
+				end
+			end
+		end
+		local total, win = 0, 0
+		for n, count in ipairs(counts) do total = total + count if n >= highest then win = win + count end end
+		return action("Choose", win / math.max(1, total) >= 0.4 and "go" or "fold")
+	end
+	function P.Dalmuti(s)
+		if not turn(s, "play") then return end
+		local d, hand, top = data("DalmutiData"), (s.my or {}).hand, s.game.top
+		if not hand then return end
+		local rank, count, jokers
+		if top then rank, count, jokers = d.weakestBeat(hand, top) else rank, count, jokers = d.weakestLead(hand) end
+		if rank and d.canPlay(hand, rank, count, jokers, top) then return action("Play", rank, count, jokers) end
+		if top then return action("Pass") end
+	end
+	function P.Nimmt(s)
+		local g, my, me, d = s.game, s.my or {}, own(s), data("NimmtData")
+		if g.phase == "choose" and g.chooser == s.mySeat then return action("Choose", d.cheapestRow(g.rows)) end
+		if g.phase == "pick" and not me.picked and not my.pick then
+			local opponents = 0
+			for seat, player in pairs(g.seats) do if seat ~= s.mySeat and type(player) == "table" and not player.out then opponents = opponents + 1 end end
+			local card = d.safestCard(my.hand or {}, g.rows, opponents)
+			if card then return action("Pick", card) end
+		end
+	end
+	function P.PharaohFury(s, mem)
+		local g, me, d = s.game, own(s), data("PharaohData")
+		if g.phase == "roll" and g.roller == s.mySeat then return action("Roll") end
+		if (g.phase ~= "hunt" and g.phase ~= "claim") or me.claimed then return end
+		if not g.dice then return end
+		local key = table.concat(g.dice, ",")
+		if mem.diceKey ~= key then mem.reachable, mem.diceKey = d.reachable(g.dice), key end
+		local best, score, expression = nil, -math.huge, nil
+		for _, tile in pairs(g.board or {}) do
+			if type(tile) == "table" and mem.reachable[tile.num] then
+				local tokens = d.simplify(mem.reachable[tile.num])
+				local value = d.evaluate(tokens, g.dice)
+				local level = d.Levels and d.Levels[tile.lvl]
+				local points = (level and level.Scarabs or 0) * 100 + tile.num
+				if value == tile.num and points > score then best, score, expression = tile, points, tokens end
+			end
+		end
+		if best then return action("Claim", expression, best.id) end
+	end
+	local yachtBaseline = {Ones = 2, Twos = 5, Threes = 8, Fours = 11, Fives = 14,
+		Sixes = 17, Choice = 21, FourKind = 13, FullHouse = 16, SmallStraight = 10, LargeStraight = 16, Yacht = 12}
+	function P.YachtDice(s, mem)
+		local g, me, d = s.game, own(s), data("YachtData")
+		if not turn(s, "turn") then return end
+		if g.rolls == 0 then return action("Roll") end
+		local sheet, dice = me.sheet or {}, g.dice
+		if not dice or #dice ~= 5 then return end
+		local best, utility, bestPoints = nil, -math.huge, 0
+		for _, cat in ipairs(d.Cats) do
+			if sheet[cat.Id] == nil then
+				local pts = d.score(cat.Id, dice)
+				local value = pts - (yachtBaseline[cat.Id] or 10) + (cat.Upper and pts * 0.25 or 0)
+				if value > utility then best, utility, bestPoints = cat.Id, value, pts end
+			end
+		end
+		if not best then return end
+		local key = table.concat({token(g), g.rolls, table.concat(dice, ",")}, ":")
+		if g.rolls >= g.maxRolls or (best == "Yacht" and bestPoints == 50)
+			or (best == "LargeStraight" and bestPoints == 30) then return action("Score", best) end
+		if mem.yachtKey ~= key then
+			local counts, held, majority = {}, {}, 1
+			for _, v in ipairs(dice) do counts[v] = (counts[v] or 0) + 1 end
+			for n, count in pairs(counts) do
+				if count > (counts[majority] or 0) or (count == (counts[majority] or 0) and n > majority) then majority = n end
+			end
+			local straightStart, straightLength = 1, 0
+			for start = 1, 3 do
+				local length = 0
+				for n = start, math.min(6, start + 4) do if counts[n] then length = length + 1 end end
+				if length > straightLength then straightStart, straightLength = start, length end
+			end
+			local useStraight = (sheet.LargeStraight == nil or sheet.SmallStraight == nil)
+				and straightLength >= 4 and (counts[majority] or 0) < 3
+			local seen = {}
+			for i, v in ipairs(dice) do
+				if useStraight then
+					held[i] = v >= straightStart and v <= straightStart + 4 and not seen[v]
+					seen[v] = true
+				else held[i] = v == majority or (best == "FullHouse" and bestPoints >= 20) end
+			end
+			mem.yachtKey, mem.yachtHold = key, held
+		end
+		local allHeld = true
+		for i = 1, 5 do
+			local wanted = mem.yachtHold[i] == true
+			if not wanted then allHeld = false end
+			if ((g.held or {})[i] == true) ~= wanted then return action("Hold", i) end
+		end
+		if allHeld then return action("Score", best) end
+		return action("Roll")
+	end
+	function P.Alibi(s, mem)
+		local g, my, me, d = s.game, s.my or {}, own(s), data("AlibiData")
+		mem.excluded, mem.tried, mem.refuted = mem.excluded or {}, mem.tried or {}, mem.refuted or {}
+		for _, id in ipairs(my.hand or {}) do mem.excluded[id] = true end
+		if my.lastShown and my.lastShown.id then mem.excluded[my.lastShown.id] = true end
+		for _, row in ipairs(g.log or {}) do
+			local key = tostring(row.s) .. ":" .. tostring(row.w) .. ":" .. tostring(row.r)
+			if row.kind == "accuse" and row.ok == false then mem.refuted[key] = true end
+			if row.kind ~= "accuse" and (row.shower or 0) > 0 then mem.refuted[key] = true end
+			if row.kind ~= "accuse" and row.by == s.mySeat then
+				mem.tried[key] = true
+				local waiting = g.phase == "show" and g.sugg and g.sugg.sid == row.sid
+				if not waiting and row.shower == 0 and (g.phase == "after" or g.turn ~= s.mySeat) then
+					mem.solution = {row.s, row.w, row.r}
+				end
+			end
+		end
+		if g.phase == "show" and g.shower == s.mySeat and my.showOpts and my.showOpts[1] then
+			return action("Show", my.showOpts[1])
+		end
+		if not turn(s) or me.elim then return end
+		if g.phase ~= "turn" and g.phase ~= "after" then return end
+		local groups = {}
+		for _, kind in ipairs(d.Kinds) do
+			groups[kind.Key] = {}
+			for _, card in ipairs(kind.List) do
+				if not mem.excluded[card.Id] then groups[kind.Key][#groups[kind.Key] + 1] = card.Id end
+			end
+		end
+		local candidates = {}
+		for _, a in ipairs(groups.S) do for _, b in ipairs(groups.W) do for _, c in ipairs(groups.R) do
+			local key = a .. ":" .. b .. ":" .. c
+			if not mem.refuted[key] then candidates[#candidates + 1] = {a, b, c, key} end
+		end end end
+		local solution = mem.solution or (#candidates == 1 and candidates[1] or nil)
+		if solution and d.validTriple(solution[1], solution[2], solution[3]) then
+			return action("Accuse", solution[1], solution[2], solution[3])
+		end
+		if g.phase == "after" then return action("End") end
+		local candidate
+		for _, c in ipairs(candidates) do if not mem.tried[c[4]] then candidate = c break end end
+		candidate = candidate or candidates[1]
+		if candidate then return action("Suggest", candidate[1], candidate[2], candidate[3]) end
+	end
+	P.supportedCount = 0
+	for _, policy in pairs(P) do if type(policy) == "function" then P.supportedCount = P.supportedCount + 1 end end
+	return P
+end
+
+end)()
+factories.humanize = (function()
+return function(fingerprint, random)
+	local H = {}
+	local pending, epoch
+	local fast = {Bell = true, React = true, Pull = true}
+	local board = {Chess = true, Omok = true, Cubitile = true, Alibi = true, PharaohFury = true}
+	local small = {Hold = true, Rotate = true, Pop = true, Flip = true, Return = true}
+	local function sample(a, b)
+		local n = math.max(0, math.min(1, random()))
+		return a + (b - a) * n
+	end
+	function H.reset()
+		pending, epoch = nil, nil
+	end
+	function H.deadline(s)
+		local g, finish = s.game or {}, nil
+		for _, v in pairs({g.phaseEndsAt, g.turnEndsAt}) do
+			if type(v) == "number" and v > 0 and (not finish or v < finish) then finish = v end
+		end
+		return finish
+	end
+	function H.interval(s, serverNow, configured)
+		local finish = H.deadline(s)
+		if finish then return math.min(configured, math.max(0.05, finish - serverNow - 0.18)) end
+		return configured
+	end
+	local function context(s, decision)
+		local g = s.game or {}
+		local key = {room = s.room, game = s.gameId, seat = s.mySeat, phase = s.phase,
+			step = g.phase, round = g.round, turn = g.turn, count = g.turnCount,
+			finish = g.phaseEndsAt, turnEnd = g.turnEndsAt, cue = g.cueAt,
+			pullStart = g.pullStart, tugs = g.tugs, num = g.num, rolls = g.rolls,
+			action = decision.action}
+		if decision.action ~= "React" and decision.action ~= "Pull" then key.args = decision.args end
+		if decision.action == "Bell" or decision.action == "Claim" then
+			key.center, key.ring, key.board = g.center, g.ring, g.board
+			key.tops = {}
+			for seat, info in pairs(g.seats or {}) do
+				if type(info) == "table" then
+					key.tops[seat] = {top = info.top, up = info.up, count = info.count, declared = info.declared}
+				end
+			end
+		end
+		return fingerprint(key)
+	end
+	function H.ready(s, decision, clock, serverNow, config, gameEpoch)
+		if epoch ~= gameEpoch then pending, epoch = nil, gameEpoch end
+		if not config.human then pending = nil return true, 0 end
+		local finish = H.deadline(s)
+		if finish and serverNow >= finish then return false, 0 end
+		local key = context(s, decision)
+		if not pending or pending.key ~= key then
+			local name, delay = decision.action
+			if fast[name] then
+				delay = sample(0.23, 0.62)
+			elseif s.gameId == "BombTrial" then delay = sample(0.25, 0.7)
+			elseif small[name] then delay = sample(0.3, 0.85)
+			elseif board[s.gameId] then delay = sample(1.2, 3.8)
+			elseif name == "Answer" then
+				local answer = decision.args and decision.args[1]
+				delay = sample(0.8, 1.7) + math.min(1.4, #(tostring(answer or "")) * 0.035)
+			else delay = sample(0.6, 1.9) end
+			delay = delay * (config.tempo or 1)
+			local urgent = fast[name] or s.gameId == "BombTrial"
+			if config.hesitate and not urgent and sample(0, 1) < 0.08 then delay = delay + sample(0.5, 1.6) end
+			local start = clock
+			if name == "React" and s.game and s.game.cueAt then start = clock + s.game.cueAt - serverNow end
+			pending = {key = key, due = start + delay}
+		end
+		local due = pending.due
+		if finish then due = math.min(due, clock + math.max(0, finish - serverNow - 0.22)) end
+		local remaining = math.max(0, due - clock)
+		return remaining <= 0, remaining
+	end
+	return H
+end
+
+end)()
+factories.runtime = (function()
+return function(deps)
+	local RunService = game:GetService("RunService")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	assert(game.PlaceId == 116905776288284, "이 스크립트는 확인된 보드게임 라운지 전용이에요")
+	local shared = getgenv()
+
+	local folder = ReplicatedStorage:FindFirstChild("TableGames")
+	assert(folder, "게임 데이터 폴더를 찾을 수 없어요")
+	local remote = folder:FindFirstChild("Remote")
+	assert(remote and remote:IsA("RemoteEvent"), "확인된 게임 통신 경로가 없어요")
+	local Core = deps.core()
+	local c = Core.new()
+	local options = {chessDepth = 3, interval = 0.35, autoStart = false, games = {},
+		human = true, tempo = 1, hesitate = true}
+	local random = Random.new()
+	local human = deps.humanize(Core.fingerprint, function() return random:NextNumber() end)
+	local loaded = {}
+	local function getData(name)
+		if loaded[name] then return loaded[name] end
+		local obj = folder:FindFirstChild(name)
+		assert(obj and obj:IsA("ModuleScript"), "게임 규칙 데이터가 없어요: " .. name)
+		local ok, result = pcall(require, obj)
+		assert(ok and type(result) == "table", "게임 규칙을 읽지 못했어요: " .. name)
+		loaded[name] = result
+		return result
+	end
+	local env = {data = getData, capitals = deps.capitals(), chessDepth = options.chessDepth}
+	local policies = deps.strategies(env)
+	assert(policies.supportedCount == 34, "게임별 로직 개수가 맞지 않아요")
+	local previous = shared.PLAY_TABLE_AUTO
+	if type(previous) == "table" and type(previous.Stop) == "function" then previous.Stop() end
+	local alive, thinking, generation = true, false, 1
+	local cached
+	local connections, window, statusLabel, detailLabel, toggle = {}, nil, nil, nil, nil
+	local lastUi, lastProblem, accumulator = 0, nil, 0
+	local statusText, detailText = "서버 상태를 기다리는 중", "의자에 앉아 게임을 시작하면 자동으로 감지해요"
+	local names = {}
+	for _, spec in ipairs(deps.catalog) do names[spec.id], options.games[spec.id] = spec.Name, true end
+	local function setStatus(text, detail)
+		statusText = text
+		if detail then detailText = detail end
+	end
+	local function pause(reason)
+		c.enabled = false
+		generation = generation + 1
+		human.reset()
+		lastProblem = reason
+		setStatus("자동 플레이가 중지됐어요", reason)
+		if toggle then toggle:Set(false, true) end
+		if window then window:Notify({Title = "자동 플레이 중지", Content = reason, Kind = "Warning"}) end
+	end
+	local function stop()
+		if not alive then return end
+		alive, c.enabled = false, false
+		generation = generation + 1
+		human.reset()
+		for _, conn in ipairs(connections) do conn:Disconnect() end
+		connections = {}
+		if shared.PLAY_TABLE_AUTO and shared.PLAY_TABLE_AUTO.Controller == c then shared.PLAY_TABLE_AUTO = nil end
+		if window then local old = window window = nil old:Destroy() end
+	end
+	local api = {Stop = stop, Controller = c, Version = "2026.10.20-02"}
+	shared.PLAY_TABLE_AUTO = api
+	local actionNames = {Bell = "종 치기", Play = "패 내기", Draw = "패 뽑기", Flip = "카드 뒤집기",
+		Guess = "숫자 추리", Reveal = "패 공개", Place = "놓기", Stop = "추리 멈추기", Submit = "타일 등록",
+		Buy = "구매 판단", Build = "건물 선택", Fly = "도착지 선택", Mode = "방식 선택", Roll = "주사위 굴리기",
+		Hit = "블록 치기", Pick = "선택", Pull = "블록 당기기", Return = "토큰 반납", Reserve = "카드 예약",
+		Take = "가져오기", Claim = "정답 선택", Rotate = "방향 맞추기", Pop = "꼬치 빼기", Serve = "서빙",
+		Spin = "문 돌리기", Answer = "정답 입력", Pass = "넘기기", React = "반응", Press = "이빨 누르기",
+		Say = "숫자 말하기", Clap = "박수", Vote = "투표", Choose = "선택", Stab = "칼 꽂기",
+		Score = "점수 기록", Hold = "주사위 보관", Show = "카드 제시", Suggest = "사건 추리", Accuse = "최종 지목",
+		End = "차례 종료", StartNow = "게임 시작"}
+	local function observe(s)
+		local ok, err = pcall(Core.accept, c, s, os.clock())
+		if not ok then pause("서버 상태를 읽지 못했어요: " .. tostring(err)) return end
+		if type(s) ~= "table" or not s.mySeat or c.state ~= s then return end
+		local g = s.game
+		if s.gameId == "HammerRPS" and g then
+			if s.action and s.action.kind == "react" and s.action.seat == s.mySeat then c.memory.reactRound = g.round end
+		end
+		if s.phase == "playing" then
+			setStatus((names[s.gameId] or "알 수 없는 게임") .. " 감지", c.enabled and "게임 상태에 맞춰 다음 행동을 판단해요" or "일시 정지 중")
+		else
+			setStatus(s.phase == "waiting" and "대기실" or "시작 또는 결과를 기다리는 중", "자동 플레이는 진행 중인 게임에서 동작해요")
+		end
+	end
+	connections[#connections + 1] = remote.OnClientEvent:Connect(function(kind, s)
+		if not alive then return end
+		if kind == "State" then observe(s) end
+	end)
+	local function plan(s, memory, now)
+		if s.phase == "waiting" and options.autoStart and s.host == s.mySeat and s.gameId then
+			local count = 0
+			for _, seat in pairs(s.seats or {}) do if seat then count = count + 1 end end
+			if count >= (s.minPlayers or 2) then return {action = "StartNow", args = {n = 0}, channel = "lobby"} end
+		end
+		if s.phase ~= "playing" or type(s.game) ~= "table" then return end
+		local policy = policies[s.gameId]
+		if not policy then error("지원 목록과 게임 ID가 달라졌어요: " .. tostring(s.gameId)) end
+		if not options.games[s.gameId] then return end
+		local me = s.game.seats and s.game.seats[s.mySeat]
+		if type(me) ~= "table" or me.out or me.bankrupt then return end
+		return policy(s, memory, now)
+	end
+	local function tick()
+		if not alive then return end
+		local clock = os.clock()
+		if clock - lastUi >= 0.5 then
+			lastUi = clock
+			if statusLabel then statusLabel:SetText(statusText) end
+			if detailLabel then detailLabel:SetText(detailText .. " · 전송 " .. c.count .. "회") end
+		end
+		local s = c.state
+		if not c.enabled or not s or thinking or Core.hasSent(c) then return end
+		local interval = human.interval(s, workspace:GetServerTimeNow(), options.interval)
+		if clock - c.lastSent < interval then return end
+		if clock - c.received > 20 then setStatus("새 서버 상태를 기다리는 중", "상태 다시 받기 버튼으로 현재 상태를 요청할 수 있어요") return end
+		if not s.mySeat then return end
+		thinking = true
+		local serial, signature, memory = generation, c.signature, c.memory
+		task.spawn(function()
+			local ok, decision
+			if cached and cached.state == s and cached.generation == serial then
+				ok, decision = true, cached.decision
+			else
+				ok, decision = pcall(plan, s, memory, workspace:GetServerTimeNow())
+			end
+			thinking = false
+			if not alive or generation ~= serial or c.state ~= s or c.signature ~= signature then return end
+			if not ok then c.errors = c.errors + 1 pause("판단 중 오류: " .. tostring(decision)) return end
+			if not decision then return end
+			if decision.action ~= "Pull" and decision.action ~= "React" then
+				cached = {state = s, generation = serial, decision = decision}
+			end
+			local ready, remaining = human.ready(s, decision, os.clock(), workspace:GetServerTimeNow(), options, c.epoch)
+			if not ready then
+				setStatus((names[s.gameId] or "게임") .. " 생각하는 중", string.format("다음 행동까지 약 %.1f초", remaining))
+				return
+			end
+			if Core.reserve(c, s, decision, os.clock(), interval) then
+				local sent, err = pcall(function()
+					local unpack = table.unpack or unpack
+					if decision.channel == "lobby" then
+						remote:FireServer(decision.action)
+					else
+						remote:FireServer("Game", decision.action, unpack(decision.args, 1, decision.args.n))
+					end
+				end)
+				if not sent then pause("전송 결과가 불확실해 중지했어요: " .. tostring(err)) return end
+				setStatus((names[s.gameId] or "게임") .. " 자동 플레이", (actionNames[decision.action] or "게임 행동") .. " 전송 · 서버 반영 대기")
+			end
+		end)
+	end
+	local built, buildError = pcall(function()
+		window = UI:CreateWindow({Id = "play-table-auto-34", Title = "보드게임 자동 플레이",
+			Subtitle = "34개 게임 자동 감지", Theme = "CodexDark", Locale = "ko", CloseBehavior = "Minimize", Width = 540, Height = 540})
+		local main = window:Tab({Id = "main", Title = "자동 플레이"})
+		local control = main:Section({Title = "실행 제어"})
+		statusLabel = control:Label({Id = "status", Text = statusText})
+		detailLabel = control:Label({Id = "detail", Text = detailText})
+		toggle = control:Toggle({Id = "enabled", Text = "자동 플레이", Default = true, Persist = false, Callback = function(value)
+			c.enabled = value
+			generation = generation + 1
+			human.reset()
+			lastProblem = nil
+			setStatus(value and "자동 플레이 켜짐" or "일시 정지", "게임 상태를 확인하고 있어요")
+		end})
+		control:Button({Id = "refresh", Text = "상태 다시 받기", ActionText = "요청", Callback = function()
+			remote:FireServer("Hello")
+			setStatus("현재 서버 상태 요청", "새 상태가 도착하면 갱신해요")
+		end})
+		control:Slider({Id = "interval", Text = "행동 사이 최소 간격", Min = 0.15, Max = 1.5, Step = 0.05,
+			Default = options.interval, Persist = false, Callback = function(value) options.interval = value end})
+		control:Slider({Id = "chessDepth", Text = "체스 탐색 깊이", Min = 1, Max = 4, Step = 1,
+			Default = 3, Persist = false, Callback = function(value) options.chessDepth, env.chessDepth = value, value end})
+		control:Toggle({Id = "autoStart", Text = "방장일 때 대기실 자동 시작", Default = false, Persist = false,
+			Callback = function(value) options.autoStart = value end})
+		local natural = main:Section({Title = "사람처럼 플레이"})
+		natural:Toggle({Id = "human", Text = "자연스러운 생각·반응 시간", Default = true, Persist = false,
+			Callback = function(value) options.human = value human.reset() generation = generation + 1 end})
+		natural:Slider({Id = "tempo", Text = "생각하는 시간 배율", Description = "높일수록 천천히 판단해요",
+			Min = 0.6, Max = 1.8, Step = 0.1, Default = 1, Persist = false,
+			Callback = function(value) options.tempo = value human.reset() generation = generation + 1 end})
+		natural:Toggle({Id = "hesitate", Text = "가끔 한 번 더 생각하기", Default = true, Persist = false,
+			Callback = function(value) options.hesitate = value human.reset() generation = generation + 1 end})
+		natural:Paragraph({Text = "게임에 맞는 행동 속도", Content = "체스·오목·추리는 조금 더 생각하고, 종·망치·폭탄은 빠르게 반응해요. 행동마다 기다리는 시간이 달라져요. 남은 시간이 적으면 대기를 줄이며, 움직이는 게이지는 현재 위치를 다시 확인해요."})
+		control:Button({Id = "stop", Text = "자동 플레이 완전 종료", ActionText = "종료", Style = "Danger", Callback = stop})
+		local info = main:Section({Title = "사용 방법"})
+		info:Paragraph({Text = "의자에 앉고 원하는 게임을 선택하세요", Content = "진행 게임을 자동으로 감지해요. 승패는 게임 규칙과 상대 행동에 따라 달라져요. 수도 맞히기는 내장 사전과 공개된 정답을 사용하며, 모르는 문제는 넘겨요. 알리바이는 근거가 모였을 때 최종 지목해요."})
+		local games = window:Tab({Id = "games", Title = "게임별 설정"})
+		local section = games:Section({Title = "게임별 자동 플레이"})
+		for _, spec in ipairs(deps.catalog) do
+			local id = spec.id
+			section:Toggle({Id = "game_" .. id, Text = spec.Name, Default = true, Persist = false,
+				Callback = function(value) options.games[id] = value human.reset() generation = generation + 1 end})
+		end
+		window:OnDestroy(stop)
+	end)
+	if not built then stop() error("자동 플레이 창 생성 실패: " .. tostring(buildError)) end
+	connections[#connections + 1] = RunService.Heartbeat:Connect(function(dt)
+		accumulator = accumulator + dt
+		if accumulator >= 0.05 then accumulator = 0 tick() end
+	end)
+	local helloOk, helloError = pcall(function() remote:FireServer("Hello") end)
+	if not helloOk then pause("현재 상태 요청 실패: " .. tostring(helloError)) end
+	api.Window = window
+	return api
+end
+
+end)()
+local catalog = {
+	{id = "OneCard", Name = "원카드"},
+	{id = "HolyMoly", Name = "홀리몰리"},
+	{id = "HalliGalli", Name = "홀리몰리 디럭스"},
+	{id = "MysteryCode", Name = "미스터리 코드"},
+	{id = "Cubitile", Name = "큐비타일"},
+	{id = "KoreaMarble", Name = "한국마블"},
+	{id = "BaconBreak", Name = "베이컨 블록 깨기"},
+	{id = "Ppega", Name = "빼가"},
+	{id = "MemoryEmoji", Name = "메모리 게임"},
+	{id = "MemoryRoblox", Name = "메모리 게임 팔삼씨"},
+	{id = "Sugarlander", Name = "슈가랜더"},
+	{id = "Robble", Name = "로블"},
+	{id = "RobbleRoblox", Name = "로블 - 로블록스"},
+	{id = "RobbleBrainrot", Name = "로블 - 브레인롯"},
+	{id = "NewbieRoulette", Name = "뉴비 룰렛"},
+	{id = "SkewerMaster", Name = "스큐어 마스터"},
+	{id = "Omok", Name = "오목"},
+	{id = "Chess", Name = "체스"},
+	{id = "LaCucaracha", Name = "떴다! 바선생"},
+	{id = "CapitalQuiz", Name = "수도 맞히기"},
+	{id = "HammerRPS", Name = "뿅망치 가위바위보"},
+	{id = "MukJjiPpa", Name = "묵찌빠"},
+	{id = "CrocDentist", Name = "악어 이빨"},
+	{id = "ThreeSixNine", Name = "369 게임"},
+	{id = "PharaohFury", Name = "파라오의 분노"},
+	{id = "YachtDice", Name = "요트"},
+	{id = "BombTrial", Name = "폭탄의 시련"},
+	{id = "ThankYouNext", Name = "땡큐 넥스트"},
+	{id = "MafiaClassic", Name = "마피아 클래식"},
+	{id = "ThiefCat", Name = "도둑 고양이"},
+	{id = "IndianCard", Name = "인디언 카드"},
+	{id = "Dalmuti", Name = "계급사회"},
+	{id = "Nimmt", Name = "육수님트"},
+	{id = "Alibi", Name = "알리바이"},
+}
+return factories.runtime({core = factories.core, capitals = factories.capitals, strategies = factories.strategies, humanize = factories.humanize, catalog = catalog})
