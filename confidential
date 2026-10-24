@@ -1,0 +1,424 @@
+-- 기밀서류 획득과 판매 개별 도우미 1.1.0
+local factories = {}
+factories["prompt_focus"] = (function()
+return function(env)
+	local M, state = {}, nil
+	local function watch(event, field)
+		env.window:Give(env.prompts[event]:Connect(function(prompt)
+			local s = state
+			if s and s.prompt == prompt then s[field] = env.clock() end
+		end))
+	end
+	watch("PromptShown", "shown")
+	watch("PromptHidden", "hidden")
+	watch("PromptButtonHoldBegan", "began")
+	watch("PromptButtonHoldEnded", "ended")
+	watch("PromptTriggered", "triggered")
+	local function position(prompt)
+		local parent = prompt.Parent
+		if not parent then return nil end
+		if parent:IsA("Attachment") then return parent.WorldPosition, parent.Parent end
+		if parent:IsA("BasePart") then return parent.Position, parent end
+		if parent:IsA("Model") and parent.PrimaryPart then return parent.PrimaryPart.Position, parent.PrimaryPart end
+	end
+	local function visible(origin, target, part, char)
+		local delta = target - origin
+		if delta.Magnitude < 0.1 then return false end
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = {char}
+		local hit = env.world:Raycast(origin, delta, params)
+		return not hit or hit.Instance == part
+	end
+	function M.stop()
+		local s = state
+		state = nil
+		if not s then return end
+		if s.sent then pcall(function() s.prompt:InputHoldEnd() end) end
+		pcall(function()
+			if env.world.CurrentCamera == s.camera and s.camera.CameraType == Enum.CameraType.Scriptable then
+				-- 이동 전 절대 CFrame으로 되돌리지 않고 기본 카메라에 제어만 돌려준다.
+				s.camera.CameraType = s.kind
+			end
+		end)
+	end
+	function M.start(prompt, char)
+		M.stop()
+		local camera = env.world.CurrentCamera
+		local root = char:FindFirstChild("HumanoidRootPart")
+		local head = char:FindFirstChild("Head") or root
+		local target, part = position(prompt)
+		if not camera or not root or not head or not target then return false, "프롬프트 시야 대상을 찾지 못했습니다" end
+		if camera.CameraType == Enum.CameraType.Scriptable then return false, "다른 카메라 연출이 진행 중입니다" end
+		if not env.prompts.Enabled then return false, "게임의 프롬프트 서비스가 비활성화되어 있습니다" end
+		local eye
+		-- 머리에서 뒤로 몇 스터드 이동시키면 벽·책상 뒤로 들어갈 수 있다.
+		for _, offset in ipairs({Vector3.new(), Vector3.new(0, 0.5, 0)}) do
+			local candidate = head.Position + offset
+			if not prompt.RequiresLineOfSight or visible(candidate, target, part, char) then eye = candidate; break end
+		end
+		if not eye or (target - eye).Magnitude < 0.1 then return false, "캐릭터 눈높이에서 대상 시야가 막혀 있습니다" end
+		local delta = target - eye
+		local up = math.abs(delta.Unit.Y) > 0.98 and Vector3.new(0, 0, 1) or Vector3.new(0, 1, 0)
+		local s = {camera = camera, root = root, char = char, prompt = prompt, part = part,
+			at = env.clock(), kind = camera.CameraType, target = target, origin = root.Position}
+		state = s
+		camera.CameraType = Enum.CameraType.Scriptable
+		camera.CFrame = CFrame.lookAt(eye, target, up)
+		camera.Focus = CFrame.new(target)
+		return true
+	end
+	function M.tick()
+		local s = state
+		if not s then return "error", "프롬프트 시야 작업이 없습니다" end
+		local now = env.clock()
+		if env.player.Character ~= s.char or not s.root.Parent or not s.prompt.Parent or not s.prompt.Enabled then return "error", "캐릭터 또는 프롬프트 상태가 바뀌었습니다" end
+		if env.world.CurrentCamera ~= s.camera or s.camera.CameraType ~= Enum.CameraType.Scriptable then return "error", "다른 카메라 제어가 시작되었습니다" end
+		local target, part = position(s.prompt)
+		if not target or (target - s.root.Position).Magnitude > s.prompt.MaxActivationDistance then return "error", "프롬프트 상호작용 거리를 벗어났습니다" end
+		if (s.root.Position - s.origin).Magnitude > 1.5 or (target - s.target).Magnitude > 0.5 then return "error", "캐릭터나 대상이 움직여 시야를 다시 확인해야 합니다" end
+		local point, onScreen = s.camera:WorldToViewportPoint(target)
+		local clear = not s.prompt.RequiresLineOfSight or visible(s.camera.CFrame.Position, target, part, s.char)
+		if onScreen and point.Z > 0 and clear then
+			s.stableAt = s.stableAt or now
+			-- 시작 전에 이미 표시된 프롬프트는 PromptShown을 재발행하지 않는다.
+			-- 표시 이벤트 누락을 회전으로 유도하지 않고 실제 HoldBegan/Triggered로 검증한다.
+			if now - s.stableAt >= 0.3 then return "ready" end
+		else s.stableAt = nil end
+		if now - s.at >= 4 then return "error", "프롬프트가 화면 안에서 안정적으로 보이지 않습니다" end
+		return "waiting"
+	end
+	function M.begin()
+		local status, why = M.tick()
+		if status ~= "ready" then return false, why or "프롬프트 시야가 아직 준비되지 않았습니다" end
+		local s = state
+		if s.sent then return false, "이미 프롬프트 누르기를 시작했습니다" end
+		s.sent, s.sentAt = true, env.clock()
+		s.began, s.ended, s.triggered, s.hidden = nil, nil, nil, nil
+		local ok, err = pcall(function() s.prompt:InputHoldBegin() end)
+		if not ok then M.stop(); return false, tostring(err) end
+		return true
+	end
+	function M.holdStatus()
+		local s = state
+		if not s or not s.sent then return "error", "누르기 입력이 시작되지 않았습니다" end
+		if s.triggered then return "triggered" end
+		local now = env.clock()
+		if now - s.sentAt >= 0.75 and not s.began then return "error", "InputHoldBegin을 호출했지만 게임의 누르기 시작 이벤트가 없습니다" end
+		if (s.hidden and now - s.hidden >= 0.25) or (s.ended and now - s.ended >= 0.25) then return "error", "프롬프트가 숨겨지거나 누르기가 취소되어 실행되지 않았습니다" end
+		local status, why = M.tick()
+		if status == "error" then return status, why end
+		return "holding"
+	end
+	function M.snapshot()
+		local s = state
+		return s and {shown = s.shown ~= nil, began = s.began ~= nil, triggered = s.triggered ~= nil, sent = s.sent == true} or nil
+	end
+	env.window:OnDestroy(M.stop)
+	return M
+end
+end)()
+factories["movement"] = (function()
+return function(env)
+	local M = {}
+	function M.teleport(part, reach, char, human, root)
+		human:MoveTo(root.Position); human:Move(Vector3.new())
+		local ray, vision, overlap = RaycastParams.new(), RaycastParams.new(), OverlapParams.new()
+		ray.FilterType, vision.FilterType, overlap.FilterType = Enum.RaycastFilterType.Exclude, Enum.RaycastFilterType.Exclude, Enum.RaycastFilterType.Exclude
+		ray.FilterDescendantsInstances, vision.FilterDescendantsInstances, overlap.FilterDescendantsInstances = {char, part}, {char}, {char, part}
+		ray.RespectCanCollide, overlap.RespectCanCollide = true, true
+		local offsets, radius = {}, math.min(5, math.max(1, reach * 0.45))
+		for _, radiusNow in ipairs({radius, math.min(8, radius + 2), 0}) do
+			for i = 0, 7 do
+				local angle = i * math.pi / 4
+				offsets[#offsets + 1] = Vector3.new(math.cos(angle) * radiusNow, 0, math.sin(angle) * radiusNow)
+				if radiusNow == 0 then break end
+			end
+		end
+		table.sort(offsets, function(a, b) return (part.Position + a - root.Position).Magnitude < (part.Position + b - root.Position).Magnitude end)
+		local height = human.HipHeight + root.Size.Y / 2 + (human.RigType == Enum.HumanoidRigType.R6 and 2 or 0) + 0.1
+		for _, offset in ipairs(offsets) do
+			local floor = env.world:Raycast(part.Position + offset + Vector3.new(0, 3, 0), Vector3.new(0, -40, 0), ray)
+			if floor and floor.Normal.Y > 0.6 then
+				local goal = floor.Position + Vector3.new(0, height, 0)
+				if (goal - part.Position).Magnitude < reach - 0.3 then
+					local blocked = false
+					for _, object in ipairs(env.world:GetPartBoundsInBox(CFrame.new(goal + Vector3.new(0, 0.6, 0)), Vector3.new(3, 4, 3), overlap)) do
+						if object.CanCollide then blocked = true; break end
+					end
+					local eye = goal + Vector3.new(0, 1.5, 0)
+					local hit = env.world:Raycast(eye, part.Position - eye, vision)
+					if not blocked and (not hit or hit.Instance == part) then
+						char:PivotTo(char:GetPivot() + (goal - root.Position))
+						root.AssemblyLinearVelocity = Vector3.new()
+						human:MoveTo(goal)
+						return goal
+					end
+				end
+			end
+		end
+		return nil, "문서 근처에 바닥·빈 공간·시야를 확보하지 못했습니다"
+	end
+	return M
+end
+end)()
+factories["runtime"] = (function()
+return function(env)
+	local M = {alive = true, busy = false, stage = "idle", message = "훔치고 판매하기를 누르면 획득부터 판매까지 진행합니다", completed = 0, sales = 0, repeatCycle = false}
+	local player, clock, focus = env.player, env.clock, env.focus
+	local target, job, activeChar, goal, deadline, holdUntil, verifyUntil, inputError, origin, saleTool, baseCoin, equipAt
+	local changed = function() end
+	local function character()
+		local c = player.Character
+		local root = c and c:FindFirstChild("HumanoidRootPart")
+		local human = c and c:FindFirstChildOfClass("Humanoid")
+		if root and human and human.Health > 0 then return c, root, human end
+	end
+	function M.tool()
+		for _, box in pairs({player:FindFirstChildOfClass("Backpack"), player.Character}) do
+			for _, item in ipairs(box:GetChildren()) do
+				if item:IsA("Tool") and item.Name:find("기밀", 1, true) then return item end
+			end
+		end
+	end
+	function M.coin()
+		local stats = player:FindFirstChild("leaderstats")
+		local value = stats and stats:FindFirstChild("Coin")
+		return value and tonumber(value.Value)
+	end
+	local function owned(tool)
+		return tool and (tool.Parent == player.Character or tool.Parent == player:FindFirstChildOfClass("Backpack"))
+	end
+	local function publish(message)
+		if message then M.message = message end
+		changed(M)
+	end
+	function M.onChanged(callback) changed = callback end
+	function M.snapshot()
+		local tool = M.tool()
+		return {busy = M.busy, stage = M.stage, message = M.message, completed = M.completed, sales = M.sales, job = job,
+			coin = M.coin(), tool = tool and tool.Name or "없음", canReturn = origin ~= nil and origin.char == player.Character}
+	end
+	function M.stop(message)
+		local wasBusy = M.busy
+		M.busy, M.stage = false, "idle"
+		focus.stop()
+		if wasBusy then
+			local _, root, human = character()
+			if root then human:MoveTo(root.Position); human:Move(Vector3.new()) end
+		end
+		target, job, activeChar, goal, inputError, saleTool, baseCoin = nil, nil, nil, nil, nil, nil, nil
+		publish(message or "정지했습니다")
+	end
+	local function beginJob(kind, char, root, human)
+		focus.stop()
+		job, saleTool, baseCoin, inputError = kind, kind == "sell" and M.tool() or nil, nil, nil
+		if kind == "sell" and not saleTool then M.stop("판매할 기밀서류가 없습니다"); return false end
+		local folder = env.world:FindFirstChild(kind == "sell" and "상호작용" or "기밀서류방")
+		if not folder then M.stop("현재 복제된 맵에서 " .. (kind == "sell" and "판매 지점" or "기밀서류방") .. "을 찾지 못했습니다"); return false end
+		local candidates = {}
+		for _, prompt in ipairs(folder:GetDescendants()) do
+			local part = prompt.Parent
+			if prompt:IsA("ProximityPrompt") and prompt.Enabled and prompt.MaxActivationDistance > 0 and part and part:IsA("BasePart") then
+				local match = kind == "sell" and prompt.ObjectText:find("기밀서류 아이템 필요", 1, true)
+					or kind == "pickup" and prompt.ActionText == "기밀서류 훔치기" and part.Transparency < 1
+				if match then candidates[#candidates + 1] = prompt end
+			end
+		end
+		table.sort(candidates, function(a, b) return (a.Parent.Position - root.Position).Magnitude < (b.Parent.Position - root.Position).Magnitude end)
+		if #candidates == 0 then M.stop(kind == "sell" and "활성화된 기밀서류 판매 프롬프트가 없습니다" or "지금 활성화된 기밀서류가 없습니다"); return false end
+		if human.Sit then human.Sit = false; human.Jump = true end
+		target = nil
+		local why
+		for _, prompt in ipairs(candidates) do
+			goal, why = env.movement.teleport(prompt.Parent, math.max(0, prompt.MaxActivationDistance - 1), char, human, root)
+			if goal then target = prompt; break end
+		end
+		if not target then M.stop(why or "대상 근처로 이동하지 못했습니다"); return false end
+		M.busy, M.stage, activeChar, deadline, verifyUntil = true, "settling", char, clock() + 25, clock() + 0.9
+		publish((kind == "sell" and "판매 지점" or "기밀서류") .. ": 텔레포트 후 위치 확인")
+		return true
+	end
+	function M.start()
+		if not M.alive or M.busy then return false end
+		if not env.supported then publish("현재 체험은 이 기밀서류 도우미의 지원 대상이 아닙니다"); return false end
+		local char, root, human = character()
+		if not char then publish("살아 있는 캐릭터를 찾지 못했습니다"); return false end
+		if env.beforeStart then env.beforeStart() end
+		origin = {char = char, pivot = char:GetPivot()}
+		return beginJob(M.tool() and "sell" or "pickup", char, root, human)
+	end
+	function M.returnToStart()
+		local saved = origin
+		M.stop("시작 위치로 돌아갑니다")
+		local char, root, human = character()
+		if not saved or saved.char ~= char then publish("돌아갈 위치가 없거나 캐릭터가 바뀌었습니다"); return false end
+		char:PivotTo(saved.pivot)
+		root.AssemblyLinearVelocity = Vector3.new()
+		human:MoveTo(root.Position)
+		origin = nil
+		publish("시작 위치로 복귀를 요청했습니다")
+		return true
+	end
+	local function verify(message, seconds)
+		focus.stop()
+		M.stage, verifyUntil = "verify", clock() + seconds
+		publish(message)
+	end
+	local function aim(char)
+		local ok, why = focus.start(target, char)
+		if not ok then M.stop(why); return end
+		M.stage = "focusing"; publish((job == "sell" and "판매" or "획득") .. ": 프롬프트 시야 확인")
+	end
+	local function tick()
+		if not M.busy then return end
+		local now = clock()
+		local char, root, human = character()
+		if char ~= activeChar then M.stop("캐릭터가 바뀌어 정지했습니다"); return end
+		if job == "pickup" and M.tool() then
+			M.completed = M.completed + 1
+			focus.stop()
+			job, M.stage, verifyUntil, deadline = nil, "next-sale", now + 0.4, now + 25
+			publish("실제 서류 획득 확인: 판매 지점으로 이동합니다")
+			return
+		end
+		if job == "sell" and baseCoin and not owned(saleTool) and not M.tool() and (M.coin() or -math.huge) - baseCoin >= 4500 then
+			M.sales = M.sales + 1
+			if not M.repeatCycle then M.stop("서류 소모와 4,500 코인 이상 증가 확인: 판매 완료"); return end
+			focus.stop()
+			job, M.stage, verifyUntil, deadline = nil, "pause", now + 5, now + 15
+			publish("판매 완료: 5초 뒤 다음 기밀서류를 찾습니다")
+			return
+		end
+		if now >= deadline then M.stop("제한 시간 안에 결과를 확인하지 못해 정지했습니다"); return end
+		if M.stage == "next-sale" or M.stage == "pause" then
+			if M.stage == "next-sale" and not M.tool() then M.stop("획득한 서류가 판매 이동 전에 사라졌습니다"); return end
+			if M.stage == "pause" and not M.repeatCycle then M.stop("판매 완료: 반복을 해제해 정지했습니다"); return end
+			if now >= verifyUntil then beginJob(M.tool() and "sell" or "pickup", char, root, human) end
+			return
+		end
+		if M.stage == "verify" then
+			if now >= verifyUntil then M.stop(inputError or (job == "sell" and "판매 입력 뒤 서류 소모·보상 증가가 확인되지 않았습니다. 자동 재입력 없이 정지했습니다" or "서류 지급이 확인되지 않았습니다. 자동 재입력 없이 정지했습니다")) end
+			return
+		end
+		if not target or not target.Parent or not target:IsDescendantOf(env.world) then M.stop("상호작용 대상이 사라졌습니다"); return end
+		if job == "sell" and not baseCoin and not owned(saleTool) then M.stop("판매 입력 전에 운반하던 서류가 사라졌습니다"); return end
+		if M.stage == "settling" then
+			if now < verifyUntil then return end
+			if (root.Position - goal).Magnitude > 3 or (root.Position - target.Parent.Position).Magnitude > target.MaxActivationDistance - 0.3 then M.stop("서버가 위치를 보정했거나 대상과의 거리가 멉니다"); return end
+			if job == "sell" then
+				if saleTool.Parent ~= char then human:EquipTool(saleTool) end
+				M.stage, equipAt = "equipping", now
+				publish("판매할 기밀서류를 손에 장착합니다")
+			else aim(char) end
+		elseif M.stage == "equipping" then
+			if saleTool.Parent == char and now - equipAt >= 0.4 then aim(char)
+			elseif now - equipAt >= 4 then M.stop("기밀서류를 손에 장착하지 못했습니다") end
+		elseif M.stage == "focusing" then
+			local status, why = focus.tick()
+			if status == "error" then M.stop(why)
+			elseif status == "ready" then
+				if job == "sell" then
+					baseCoin = M.coin()
+					if not baseCoin then M.stop("판매 보상을 확인할 Coin 값이 복제되지 않았습니다"); return end
+				end
+				local ok, err = focus.begin()
+				if not ok then M.stop(err); return end
+				M.stage, holdUntil = "holding", now + math.max(0, target.HoldDuration) + 0.6
+				publish((job == "sell" and "판매" or "획득") .. ": 모바일 방식으로 누르기 유지")
+			end
+		elseif M.stage == "holding" then
+			local status, why = focus.holdStatus()
+			if status == "triggered" then verify("프롬프트 실행 확인: " .. (job == "sell" and "서류 소모와 판매 보상 대기" or "실제 서류 지급 대기"), 10)
+			elseif status == "error" then inputError = why; verify(why .. ": 실제 결과 확인", 2)
+			elseif now >= holdUntil then verify("누르기 종료: 실제 서버 결과 확인", 10) end
+		end
+	end
+	local elapsed = 0
+	env.window:Give(env.heartbeat:Connect(function(dt)
+		elapsed = elapsed + dt
+		if elapsed < 0.08 or not M.alive then return end
+		elapsed = 0
+		local ok, why = pcall(tick)
+		if not ok then M.stop("오류로 정지: " .. tostring(why)) end
+	end))
+	env.window:Give(player.CharacterRemoving:Connect(function() origin = nil; M.stop("캐릭터 변경으로 정지했습니다") end))
+	function M.destroy()
+		if not M.alive then return end
+		M.stop("도우미 종료")
+		M.alive, origin = false, nil
+	end
+	env.window:OnDestroy(M.destroy)
+	return M
+end
+end)()
+factories["view"] = (function()
+return function(env)
+	local window, runtime = env.window, env.runtime
+	local section = window:Tab({Id = "pickup", Title = "기밀서류"}):Section({Title = "기밀서류 획득과 판매", Description = "획득한 서류를 판매 지점까지 가져갑니다. 이미 소지했다면 판매부터 진행합니다."})
+	local status = section:Label({Id = "status", Text = "준비 중"})
+	local function action(callback)
+		return function()
+			local ok, why = pcall(callback)
+			if not ok then runtime.stop("오류로 정지: " .. tostring(why)) end
+		end
+	end
+	section:Toggle({Id = "repeat", Text = "판매 후 반복", Default = false, Persist = false, Callback = function(value) runtime.repeatCycle = value end})
+	local start = section:Button({Id = "start", Text = "훔치고 판매하기", Style = "Primary", Callback = action(runtime.start)})
+	local stop = section:Button({Id = "stop", Text = "정지와 카메라 복원", Style = "Danger", Callback = action(function() runtime.stop("사용자가 정지했습니다") end)})
+	local back = section:Button({Id = "return", Text = "시작 위치로 돌아가기", Callback = action(runtime.returnToStart)})
+	section:Button({Id = "destroy", Text = "도우미 종료", Callback = function() window:Destroy() end})
+	local function refresh()
+		if not window.Alive then return end
+		local s = runtime.snapshot()
+		status:SetText(s.message .. "\n소지: " .. s.tool .. " · 획득 " .. s.completed .. "회 · 판매 확인 " .. s.sales .. "회")
+		start:SetDisabled(s.busy or not env.supported)
+		stop:SetDisabled(not s.busy)
+		back:SetDisabled(not s.canReturn)
+	end
+	runtime.onChanged(refresh)
+	refresh()
+	return {refresh = refresh}
+end
+end)()
+factories["entry"] = (function()
+return function(env)
+	function env.start()
+		local shared = getgenv()
+		local bridge, UI = shared.UAI_BRIDGE
+		if bridge and bridge.alive and bridge.env and type(bridge.env.uiLibrary) == "function" then UI = bridge.env.uiLibrary()
+		else
+			local source = game:HttpGet("https://raw.githubusercontent.com/eaf112/Script/refs/heads/main/ui-lib")
+			local chunk, why = loadstring(source, "@secret-pickup-ui")
+			assert(chunk, "UI LIB를 읽지 못했습니다: " .. tostring(why))
+			UI = chunk()
+		end
+		local old = shared.UAI_SECRET_PICKUP
+		if old and old.window then old.window:Destroy() end
+		local window = UI:CreateWindow({Id = "uai-secret-pickup-only", Title = "기밀서류 훔치기와 판매", Subtitle = "모바일 입력과 텔레포트", Theme = "CodexDark", Locale = "ko", Width = 560, Height = 500, CloseBehavior = "Minimize"})
+		env.window, env.clock, env.world = window, os.clock, workspace
+		env.player = game:GetService("Players").LocalPlayer
+		env.prompts, env.heartbeat = game:GetService("ProximityPromptService"), game:GetService("RunService").Heartbeat
+		env.supported = game.PlaceId == 137963004715711 and game.GameId == 10031411944
+		env.beforeStart = function()
+			local hub = shared.UAI_ADAPTIVE_HUB
+			if hub and hub.hub then hub.hub.stop("개별 기밀서류 도우미 실행"); hub.hub.restoreCamera() end
+		end
+		local handle = {window = window, version = "1.1.0", env = env}
+		shared.UAI_SECRET_PICKUP = handle
+		window:OnDestroy(function() if shared.UAI_SECRET_PICKUP == handle then shared.UAI_SECRET_PICKUP = nil end end)
+		local ok, why = pcall(function()
+			env.focus = env.factories.prompt_focus(env)
+			env.movement = env.factories.movement(env)
+			env.runtime = env.factories.runtime(env)
+			env.view = env.factories.view(env)
+			handle.runtime, handle.view = env.runtime, env.view
+		end)
+		if not ok then window:Destroy(); error(why, 0) end
+		return {ready = true, version = handle.version, supported = env.supported, automation = "off"}
+	end
+	return env
+end
+end)()
+local env = {factories = factories}
+return factories.entry(env).start()
