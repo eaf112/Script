@@ -1,0 +1,492 @@
+local factories = {}
+factories["motion"] = (function()
+return function(env)
+	local P = env.player
+	local M = { enabled = false, samples = {}, used = {}, native = nil, state = nil, packets = 0, hops = 0 }
+	local function has(constants, key)
+		for _, v in pairs(constants) do if v == key then return true end end
+		return false
+	end
+	function M.prepare()
+		local scriptObject = P.PlayerScripts:FindFirstChild("Eggs")
+		local shared = getgenv()
+		local native = shared.EGG_NATIVE_MOTION
+		if native and native.schema == 2 and native.script == scriptObject then M.native = native; return end
+		assert(type(getreg) == "function" and type(getupvalues) == "function" and type(getconstants) == "function" and type(hookfunction) == "function", "현재 실행기에서 게임의 알 이동 함수를 연결할 수 없습니다")
+		if native and native.target and native.original then pcall(hookfunction, native.target, native.original) end
+		local source = assert(scriptObject, "게임 알 스크립트 없음"):GetFullName()
+		local queue, seen = {}, {}
+		local function add(fn)
+			if type(fn) ~= "function" or seen[fn] then return end
+			local ok, path = pcall(debug.info, fn, "s")
+			if ok and path == source then seen[fn] = true; queue[#queue + 1] = fn end
+		end
+		for _, value in pairs(getreg()) do add(value) end
+		local pose, own
+		local head = 1
+		while head <= #queue and head <= 600 do
+			local fn = queue[head]; head = head + 1
+			local constants = getconstants(fn)
+			local isOwn = has(constants, "ownPhase") and has(constants, "handedOff")
+			local isPose = not isOwn and not has(constants, "GetTemplate") and has(constants, "queue") and has(constants, "landAmount") and has(constants, "targetPitch") and has(constants, "swingDir") and has(constants, "dur") and has(constants, "t0")
+			if isOwn or isPose then
+				if isOwn then assert(not own, "변신 알 이동 함수 중복"); own = fn
+				else assert(not pose, "일반 알 이동 함수 중복"); pose = fn end
+			end
+			for _, value in pairs(getupvalues(fn)) do
+				add(value)
+				if type(value) == "table" then for _, child in pairs(value) do add(child) end end
+			end
+		end
+		assert(pose and own, "게임의 원본 pose·ownPose 함수를 찾지 못했습니다")
+		native = { schema = 2, script = scriptObject, pose = pose, target = own, calls = 0 }
+		native.original = hookfunction(own, function(state, now, dt)
+			native.calls = native.calls + 1
+			local controller = native.controller
+			if controller and controller.canControl() then
+				local ok, result = pcall(function() return {controller.render(state, now, dt)} end)
+				if ok and result[1] ~= nil then return unpack(result) end
+				if not ok then controller.failed(tostring(result)) end
+			end
+			if controller and controller.state then controller.release() end
+			return native.original(state, now, dt)
+		end)
+		shared.EGG_NATIVE_MOTION, M.native = native, native
+	end
+	function M.canControl()
+		local c = P.Character
+		local r = c and c:FindFirstChild("HumanoidRootPart")
+		local follow = P:FindFirstChild("DisguiseFollow")
+		return M.enabled and P:GetAttribute("Disguised") == true and not P:GetAttribute("Ragdoll") and r and not r.Anchored and not (follow and follow.Value)
+	end
+	function M.ground(x, z, fallback)
+		local ground = workspace:FindFirstChild("EggSpawn")
+		assert(ground and ground:IsA("BasePart"), "게임의 알 이동 구역이 없습니다")
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Include
+		params.FilterDescendantsInstances = {ground}
+		params.RespectCanCollide = false
+		local hit = workspace:Raycast(Vector3.new(x, ground.Position.Y + ground.Size.Y / 2 + 50, z), Vector3.new(0, -200, 0), params)
+		return hit and hit.Position.Y or fallback
+	end
+	local function inside(x, z)
+		local ground = workspace:FindFirstChild("EggSpawn")
+		if not ground then return false end
+		local p = ground.CFrame:PointToObjectSpace(Vector3.new(x, ground.Position.Y, z))
+		return math.abs(p.X) < ground.Size.X / 2 - 1 and math.abs(p.Z) < ground.Size.Z / 2 - 1
+	end
+	function M.receive(kind, rows)
+		if kind ~= "Hops" or type(rows) ~= "table" then return end
+		local now = workspace:GetServerTimeNow()
+		for _, h in ipairs(rows) do
+			if type(h) == "table" and type(h.id) == "number" and type(h.fx) == "number" and type(h.fz) == "number" and type(h.x) == "number" and type(h.z) == "number" and type(h.dur) == "number" and h.dur > 0 and h.dur < 3 then
+				M.samples[#M.samples + 1] = {id = h.id, fx = h.fx, fz = h.fz, x = h.x, z = h.z, dur = h.dur, h = h.h, t0 = h.t0, received = now}
+				M.packets = M.packets + 1
+			end
+		end
+		while #M.samples > 80 do table.remove(M.samples, 1) end
+	end
+	function M.render(state, now)
+		local c = P.Character
+		local root = c and c:FindFirstChild("HumanoidRootPart")
+		if not root then return nil end
+		if now < state.landT or not state.handedOff and Vector2.new(root.Position.X - state.x, root.Position.Z - state.z).Magnitude > 6 then return nil end
+		if M.state ~= state then
+			M.release()
+			M.state, M.oldQueue = state, state.queue
+			M.offset = root.Position.Y - M.ground(root.Position.X, root.Position.Z, state.y)
+			state.x, state.y, state.z = root.Position.X, M.ground(root.Position.X, root.Position.Z, state.y), root.Position.Z
+			state.queue, state.landedAt, state.landAmount = {}, now, 0.08
+			M.lastPosition = root.Position
+		end
+		if M.lastPosition and (Vector3.new(root.Position.X, 0, root.Position.Z) - Vector3.new(M.lastPosition.X, 0, M.lastPosition.Z)).Magnitude > 12 then error("캐릭터 위치가 외부에서 변경됐습니다") end
+		M.native.pose(state, now)
+		if #state.queue == 0 then
+			local nearest, distance
+			for i = #M.samples, 1, -1 do
+				local h = M.samples[i]
+				local key = tostring(h.id) .. ":" .. tostring(h.t0)
+				local x, z = state.x + h.x - h.fx, state.z + h.z - h.fz
+				local d = (state.x - h.fx) ^ 2 + (state.z - h.fz) ^ 2
+				if h.id ~= env.ownEggId() and now - h.received < 1.5 and not M.used[key] and inside(x, z) and (not distance or d < distance) then nearest, distance = h, d end
+			end
+			if nearest then
+				local h = nearest
+				local key = tostring(h.id) .. ":" .. tostring(h.t0)
+				local x, z = state.x + h.x - h.fx, state.z + h.z - h.fz
+				state.queue = {{id = env.ownEggId(), fx = state.x, fy = state.y, fz = state.z, x = x, y = M.ground(x, z, state.y), z = z, t0 = now, dur = h.dur, h = h.h}}
+				M.used[key], M.hops = now, M.hops + 1
+			end
+		end
+		for key, at in pairs(M.used) do if now - at > 5 then M.used[key] = nil end end
+		local x, y, z, lift, squash, angle, idle = M.native.pose(state, now)
+		root.CFrame = CFrame.new(x, y + M.offset, z) * root.CFrame.Rotation
+		root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+		M.lastPosition = root.Position
+		return x, y, z, lift, squash, angle, idle
+	end
+	function M.release()
+		if M.state then
+			M.state.queue = M.oldQueue or {}
+			M.state.ownPhase, M.state.handedOff = 0, true
+			M.state.landedAt, M.state.landAmount = workspace:GetServerTimeNow(), 0.08
+		end
+		M.state, M.oldQueue, M.lastPosition = nil, nil, nil
+	end
+	function M.failed(why)
+		M.stop(); env.failure("알 이동 정지: " .. why)
+	end
+	function M.start()
+		M.prepare(); M.enabled = true; M.native.controller = M
+	end
+	function M.stop()
+		M.enabled = false
+		if M.native and M.native.controller == M then M.native.controller = nil end
+		M.release()
+	end
+	return M
+end
+end)()
+factories["theft"] = (function()
+return function(env)
+	local P, S = env.player, env.storage
+	local A, E = require(S:WaitForChild("Animals")), require(S:WaitForChild("Eggs"))
+	local event = S:WaitForChild("EggRemotes"):WaitForChild("EggEvent")
+	local stealEvent = S:WaitForChild("RemoteEvents"):WaitForChild("StealBrainrotEvent")
+	local M = { alive = true, running = false, phase = "정지", logs = {}, connections = {}, ownId = nil, cycle = 0, pending = {}, nav = nil, target = nil, serial = 0, nextTick = 0, best = nil, lastFollowBase = nil, selected = nil, variant = "Normal", completed = 0 }
+	function M.log(text)
+		M.logs[#M.logs + 1] = tostring(text)
+		if #M.logs > 6 then table.remove(M.logs, 1) end
+	end
+	function M.connect(signal, callback)
+		local c = signal:Connect(function(...) if M.alive then callback(...) end end)
+		M.connections[#M.connections + 1] = c
+	end
+	function M.character()
+		local c = P.Character
+		local h = c and c:FindFirstChildOfClass("Humanoid")
+		local r = c and c:FindFirstChild("HumanoidRootPart")
+		if h and r and h.Health > 0 then return c, h, r end
+	end
+	function M.followBase()
+		local f = P:FindFirstChild("DisguiseFollow")
+		local v = f and f.Value
+		local bases = workspace:FindFirstChild("Bases")
+		while v and v ~= workspace do if v.Parent == bases then return v end; v = v.Parent end
+	end
+	function M.choices()
+		local stats = P:FindFirstChild("leaderstats")
+		local rebirths = stats and stats:FindFirstChild("Rebirths")
+		local rows = {}
+		for _, d in ipairs(E) do if E.canDisguise(rebirths and rebirths.Value or 0, d.name, M.variant) then rows[#rows + 1] = {name = d.name, label = d.displayName or d.name, cps = d.pet and A.getCashPerSecond(d.pet, nil, M.variant == "Normal" and nil or M.variant) or 0} end end
+		table.sort(rows, function(a, b) if a.cps == b.cps then return a.name < b.name end return a.cps > b.cps end)
+		return rows
+	end
+	local function distance(part, root)
+		if part:IsA("Attachment") then return (part.WorldPosition - root.Position).Magnitude end
+		if part:IsA("BasePart") then return (part.Position - root.Position).Magnitude end
+		return (part:GetPivot().Position - root.Position).Magnitude
+	end
+	function M.bestPet(baseId)
+		local bases = workspace:FindFirstChild("Bases")
+		local base = bases and bases:FindFirstChild(tostring(baseId))
+		if not base then return nil end
+		local owner = env.players:FindFirstChild(tostring(base:GetAttribute("Owner")))
+		if not owner or owner == P then return nil end
+		local slots = owner:FindFirstChild("Slots")
+		if not slots then return nil end
+		local best
+		for _, slot in ipairs(slots:GetChildren()) do
+			local raw = slot:GetAttribute("Slot")
+			if type(raw) == "string" and raw ~= "" and not slot:GetAttribute("StolenBy") then
+				local name, size, variant, traits = A.parseSlot(raw)
+				local cps = A.getCashPerSecond(name, slot:GetAttribute("Size") or size, variant, traits)
+				if not best or cps > best.cps or cps == best.cps and slot.Name < best.slot.Name then
+					local model
+					for _, v in ipairs(base:GetChildren()) do if v:IsA("Model") and v:GetAttribute("Owner") == owner.Name and tostring(v:GetAttribute("SlotId")) == slot.Name then model = v; break end end
+					best = { owner = owner, slot = slot, raw = raw, name = name, cps = cps, model = model, base = base }
+				end
+			end
+		end
+		return best
+	end
+	function M.stopMove()
+		M.serial = M.serial + 1
+		M.nav = nil
+	end
+	function M.stop(why)
+		M.running = false; M.phase = why or "정지"
+		M.motion.stop(); M.stopMove()
+		M.log(M.phase)
+	end
+	function M.request(key, label, send, proof)
+		if M.pending[key] then return end
+		local row = {at = os.clock(), label = label, proof = proof, state = "pending"}
+		M.pending[key] = row
+		local ok, why = pcall(send)
+		if not ok then row.state = "uncertain"; M.stop(label .. " 전송 결과 불확실: " .. tostring(why)); return end
+		M.log(label .. " 요청 전송")
+	end
+	function M.checkRequests()
+		for _, row in pairs(M.pending) do if row.state == "pending" then
+			local ok, done = pcall(row.proof)
+			if ok and done then row.state, row.proof = "confirmed", nil; M.log(row.label .. " 상태 확인")
+			elseif os.clock() - row.at > 10 then row.state = "uncertain"; M.stop(row.label .. " 결과 미확인 · 재전송 정지") end
+		end end
+	end
+	function M.move(position, label, radius)
+		if M.nav then return end
+		local c, h, root = M.character()
+		assert(c, "캐릭터가 없습니다")
+		assert(not root.Anchored, "고정된 캐릭터는 텔레포트할 수 없습니다")
+		M.motion.release()
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = {c}
+		params.RespectCanCollide = true
+		local floor = workspace:Raycast(position + Vector3.new(0, 8, 0), Vector3.new(0, -128, 0), params)
+		if floor then
+			local height = h.HipHeight + root.Size.Y / 2
+			local leg = h.RigType == Enum.HumanoidRigType.R6 and c:FindFirstChild("Left Leg")
+			if leg then height = height + leg.Size.Y end
+			position = Vector3.new(position.X, floor.Position.Y + height, position.Z)
+		end
+		M.nav = {character = c, target = position, radius = radius or 4, label = label, since = os.clock()}
+		local offset = position - root.Position
+		c:PivotTo(c:GetPivot() + offset)
+		root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = Vector3.new(0, 0, 0), Vector3.new(0, 0, 0)
+		M.log(label .. " 텔레포트")
+	end
+	function M.moveTick()
+		local job = M.nav
+		if not job then return end
+		local c, _, root = M.character()
+		if c ~= job.character then M.stop("텔레포트 중 캐릭터가 변경됐습니다"); return end
+		if os.clock() - job.since < 0.65 then return end
+		if (root.Position - job.target).Magnitude <= math.max(job.radius, 4) then M.stopMove()
+		else M.stop("텔레포트 위치가 유지되지 않아 정지했습니다") end
+	end
+	function M.start()
+		assert(M.character(), "캐릭터가 없습니다")
+		for _, row in pairs(M.pending) do assert(row.state ~= "pending" and row.state ~= "uncertain", "이전 서버 요청의 결과가 확인되지 않았습니다") end
+		M.motion.prepare()
+		M.running, M.phase = true, "알 변신 준비"
+		M.pending = {}
+		M.lastFollowBase, M.best, M.wasCarrying, M.target, M.carryAt = nil, nil, false, nil, nil
+		M.motion.start()
+		M.log("자동 훔치기 시작")
+	end
+	function M.tick()
+		M.checkRequests(); M.moveTick()
+		if not M.running then return end
+		if M.nav then M.phase = M.nav.label .. " 텔레포트 확인 중"; return end
+		for _, row in pairs(M.pending) do if row.state == "pending" and row.label == "알 변신" then M.phase = "알 변신 응답 대기"; return end end
+		local _, _, root = M.character()
+		if not root then M.stop("캐릭터가 없습니다"); return end
+		if P:GetAttribute("Ragdoll") then M.phase = "래그돌 해제 대기"; return end
+		local carrying = P:GetAttribute("Carrying")
+		if carrying then
+			M.carryAt = M.carryAt or os.clock()
+			if os.clock() - M.carryAt > 45 then M.stop("귀환 후 펫 입고를 확인하지 못했습니다"); return end
+			M.motion.stop()
+			M.phase = "최고 수익 펫 운반 · 내 기지 귀환"
+			local base = workspace.Bases:FindFirstChild(tostring(P:GetAttribute("Base")))
+			local home = base and (base:FindFirstChild("Collect") or base:FindFirstChild("Spawn"))
+			assert(home, "내 기지 귀환 지점이 없습니다")
+			local localPosition = home.CFrame:PointToObjectSpace(root.Position)
+			local inside = math.abs(localPosition.X) <= home.Size.X / 2 and math.abs(localPosition.Y) <= home.Size.Y / 2 and math.abs(localPosition.Z) <= home.Size.Z / 2
+			if not inside and not M.nav then M.move(home.Position, "내 기지 귀환", 2) end
+			M.wasCarrying = true
+			return
+		end
+		if M.wasCarrying then
+			M.wasCarrying = false
+			local steals = P:GetAttribute("Steals") or 0
+			if steals > (M.stealsBefore or steals) then M.completed = M.completed + 1; M.log("훔치기 횟수 증가 확인"); M.stop("귀환 운반 종료 · 훔치기 횟수 증가 확인")
+			else M.stop("운반이 끝났지만 펫 획득은 확인되지 않았습니다") end
+			return
+		end
+		local baseId = P:GetAttribute("StealBase")
+		if baseId then
+			M.motion.stop()
+			local best = M.bestPet(baseId)
+			M.best = best
+			if not best then M.phase = "해당 기지의 펫 복제 대기"; return end
+			local targetId = tostring(best.owner.UserId) .. ":" .. best.slot.Name
+			if M.target and M.target ~= targetId then M.stopMove() end
+			M.target = targetId
+			M.phase = "최고 수익 펫 접근: " .. best.raw
+			local model = best.model
+			if not model or not model.Parent then return end
+			local prompt = model:FindFirstChild("StealPrompt", true)
+			if not prompt then return end
+			local d = distance(prompt.Parent, root)
+			if prompt.Enabled and d <= prompt.MaxActivationDistance - 0.5 then
+				M.stopMove()
+				M.stealsBefore = P:GetAttribute("Steals") or 0
+				M.phase = "최고 수익 펫 획득 응답 대기"
+				M.request("steal:" .. M.cycle, "최고 수익 펫 훔치기", function() stealEvent:FireServer(best.owner.UserId, best.slot.Name) end, function() return P:GetAttribute("Carrying") ~= nil and P:GetAttribute("Carrying") ~= false end)
+			elseif not M.nav then M.move(prompt.Parent:IsA("Attachment") and prompt.Parent.WorldPosition or model:GetPivot().Position, "최고 수익 펫 접근", math.max(2, math.min(4, prompt.MaxActivationDistance - 2))) end
+			return
+		end
+		if P:GetAttribute("Disguised") then
+			local base = M.followBase()
+			if base and base:GetAttribute("Owner") ~= P.Name then
+				M.motion.stop(); M.lastFollowBase = base.Name
+				M.phase = "상대 기지 도착 · 부화 조건 확인"
+				if P:GetAttribute("FakeLanded") and not P:GetAttribute("OpenFrame") and (P:GetAttribute("FakeRevealAt") or 0) <= workspace:GetServerTimeNow() then
+					M.phase = "상대 기지에서 부화 응답 대기"
+					M.request("hatch:" .. M.cycle, "상대 기지에서 부화", function() event:FireServer("Undisguise") end, function() return not P:GetAttribute("Disguised") and P:GetAttribute("StealBase") ~= nil end)
+				end
+			else
+				local f = P:FindFirstChild("DisguiseFollow")
+				if f and f.Value then M.motion.release(); M.phase = "구매자가 알을 운반 중 · 기지 도착 대기"
+				else M.motion.start(); M.phase = M.motion.state and "일반 알의 원본 이동 · 구매자 대기" or "파이프 통과·알 착지 대기" end
+			end
+			return
+		end
+		if M.lastFollowBase then M.phase = "부화 후 서버 훔치기 허용 상태 대기"; return end
+		local home = workspace.Bases:FindFirstChild(tostring(P:GetAttribute("Base")))
+		local pipe = home and home:FindFirstChild("Pipe")
+		local inside = pipe and pipe:FindFirstChild("Inside")
+		assert(inside and inside:IsA("BasePart"), "자신의 변신 파이프가 없습니다")
+		if distance(inside, root) > 10 then M.motion.release(); M.phase = "내 기지 변신 파이프로 복귀"; if not M.nav then M.move(inside.Position, "변신 파이프 복귀", 6) end; return end
+		if M.nav then M.stopMove() end
+		local choices = M.choices()
+		local name = M.selected or choices[1] and choices[1].name
+		assert(name, "사용 가능한 변신 알이 없습니다")
+		M.phase = "선택한 알 변신 응답 대기"
+		M.request("disguise:" .. M.cycle, "알 변신", function() event:FireServer("Disguise", name, M.variant) end, function() return P:GetAttribute("Disguised") == true end)
+	end
+	M.motion = env.factories.motion({player = P, ownEggId = function() return M.ownId end, failure = function(why) M.stop(why) end})
+	M.connect(event.OnClientEvent, function(kind, a)
+		M.motion.receive(kind, a)
+		if kind == "Disguised" then M.ownId = a; M.cycle = M.cycle + 1; M.lastFollowBase = nil
+		elseif kind == "Undisguised" then M.motion.release() end
+	end)
+	M.connect(P.CharacterRemoving, function() M.stop("캐릭터 변경으로 정지") end)
+	M.connect(env.run.Heartbeat, function()
+		if os.clock() < M.nextTick then return end
+		M.nextTick = os.clock() + 0.12
+		local ok, why = pcall(M.tick)
+		if not ok then M.stop("작업 오류: " .. tostring(why)) end
+	end)
+	env.window:OnDestroy(function()
+		M.stop("종료"); M.alive = false
+		for _, c in ipairs(M.connections) do c:Disconnect() end
+		M.connections, M.pending = {}, {}
+	end)
+	return M
+end
+end)()
+factories["egg_names"] = (function()
+return function(env)
+	local names = {
+		Aardvark = "땅돼지", Akita = "아키타견", Albatross = "알바트로스", Amphiptere = "암피프테레",
+		Anglerfish = "아귀", Anteater = "개미핥기", Archaeopteryx = "시조새", Axolotl = "아홀로틀", Azhdarchid = "아즈다르코과 익룡",
+		Badger = "오소리", Banshee = "밴시", Bat = "박쥐", Bear = "곰", Binturong = "빈투롱",
+		BlackCat = "검은 고양이", Blobfish = "블롭피시", BloodBat = "피의 박쥐", BoneDragon = "뼈 드래곤", Bull = "황소",
+		Bunny = "토끼", Bunyip = "버닙", Caladrius = "칼라드리우스", Capybara = "카피바라", Cat = "고양이",
+		Caterpillar = "애벌레", CattleDog = "캐틀도그", Cerberus = "케르베로스", Chicken = "닭", Chimera = "키메라",
+		Chupacabra = "추파카브라", Cow = "젖소", Crab = "게", Crocodile = "악어", CursedOwl = "저주받은 올빼미",
+		CursedRaven = "저주받은 큰까마귀", Cuttlefish = "갑오징어", Dingo = "딩고", Dog = "개", Doll = "인형",
+		Dragon = "드래곤", Dragonfly = "잠자리", Duck = "오리", Dullahan = "듀라한", Elephant = "코끼리",
+		EmberHound = "불씨 사냥개", Emu = "에뮤", Fangtooth = "팽투스", Fenrir = "펜리르", Fossa = "포사",
+		Frankenstein = "프랑켄슈타인", Frog = "개구리", Gallimimus = "갈리미무스", Gargoyle = "가고일", Garuda = "가루다",
+		Ghost = "유령", GhostlyHorse = "유령 말", Ghoul = "구울", Giraffe = "기린", Goat = "염소",
+		GoblinShark = "마귀상어", Goldfish = "금붕어", Gorilla = "고릴라", GreatDane = "그레이트데인", Griffin = "그리핀",
+		Hacker = "해커", Hamster = "햄스터", Headless = "머리 없는 자", HoneyBadger = "벌꿀오소리", Horse = "말",
+		Hydra = "히드라", Hyena = "하이에나", Imp = "임프", Isopod = "등각류", JackOLantern = "잭오랜턴",
+		Jackal = "자칼", Jackalope = "재칼로프", Kangaroo = "캥거루", Kappa = "갓파", Kitsune = "키츠네",
+		Koala = "코알라", Kookaburra = "쿠카부라", Kraken = "크라켄", Leviathan = "레비아탄", Lich = "리치",
+		Lindworm = "린트부름", Lion = "사자", Lizard = "도마뱀", Llama = "라마", Mammoth = "매머드",
+		Manticore = "만티코어", MantisShrimp = "갯가재", Megalodon = "메갈로돈", Microraptor = "미크로랍토르", Minotaur = "미노타우로스",
+		Mosasaurus = "모사사우루스", Moth = "나방", Mothman = "모스맨", Nautilus = "앵무조개", Octopus = "문어",
+		Parrot = "앵무새", Peafowl = "공작", Pegasus = "페가수스", PhantomDog = "환영 사냥개", Phoenix = "불사조",
+		PlagueDoctor = "역병 의사", Plesiosaur = "플레시오사우루스", Pteranodon = "프테라노돈", Pterodactyl = "프테로닥틸루스", PumpkinGolem = "호박 골렘",
+		Qilin = "기린(신수)", Quetzalcoatlus = "케찰코아틀루스", Quokka = "쿼카", Raiju = "라이주", Raven = "큰까마귀",
+		RedPanda = "레서판다", Roc = "로크", Sabertooth = "검치호", Scarecrow = "허수아비", SeaTurtle = "바다거북",
+		Seal = "물범", Secretary = "뱀잡이수리", ShadowWolf = "그림자 늑대", Shark = "상어", Shoebill = "넓적부리황새",
+		Simurgh = "시무르그", Skeleton = "해골", SkeletonHorse = "해골 말", Specter = "망령", Sphinx = "스핑크스",
+		Spider = "거미", Spinosaurus = "스피노사우루스", SpookyBat = "으스스한 박쥐", SpookyGargoyle = "으스스한 가고일", Stegosaurus = "스테고사우루스",
+		Stymphalian = "스팀팔로스 새", Swordfish = "황새치", TRex = "티라노사우루스", Tanuki = "타누키", Thunderbird = "천둥새",
+		Tiger = "호랑이", Triceratops = "트리케라톱스", Turtle = "거북", UndeadKnight = "언데드 기사", Unicorn = "유니콘",
+		Vampire = "뱀파이어", VampireBat = "흡혈박쥐", Velociraptor = "벨로키랍토르", VoidStalker = "공허의 추적자", Werewolf = "늑대인간",
+		Whale = "고래", Witch = "마녀", WitchCat = "마녀 고양이", Wolf = "늑대", Wraith = "원혼",
+		Wyvern = "와이번", YiQi = "이치", Zebra = "얼룩말", Zombie = "좀비", ZombieCrow = "좀비 까마귀", ZombieDog = "좀비 개",
+	}
+	return function(name, fallback) return names[name] and names[name] .. " 알" or fallback or name end
+end
+end)()
+factories["theft_view"] = (function()
+return function(env)
+	local M, W, P = env.theft, env.window, env.player
+	local eggName = env.factories.egg_names(env)
+	local section = W:Tab({Id = "theft", Title = "자동 훔치기"}):Section({Title = "알로 위장해 최고 수익 펫 훔치기", Description = "일반 알 이동 → 구매자 기지 도착 → 부화 → 최고 수익 펫 획득 → 내 기지 귀환"})
+	local function safe(fn)
+		return function(...)
+			local ok, why = pcall(fn, ...)
+			if not ok then M.log(tostring(why)); W:Notify({Title = "훔치기", Content = tostring(why), Kind = "Warning"}) end
+		end
+	end
+	local options, choices = {}, M.choices()
+	local selectedValid = false
+	for _, d in ipairs(choices) do options[#options + 1] = {Value = d.name, Label = eggName(d.name, d.label)}; if d.name == M.selected then selectedValid = true end end
+	if not selectedValid then M.selected = nil end
+	M.selected = M.selected or choices[1] and choices[1].name
+	local choice = section:Dropdown({Text = "위장할 알", Options = options, Default = M.selected, Searchable = true, Callback = function(v) M.selected = v end})
+	local status = section:Label({Text = "정지"})
+	local target = section:Label({Text = "상대 기지에서 실제 수익이 가장 높은 펫을 자동 선택합니다."})
+	section:Button({Text = "자동 훔치기 시작", Callback = safe(M.start)})
+	section:Button({Text = "전체 정지", Callback = function() M.stop("사용자가 정지했습니다") end})
+	section:Button({Text = "최소화", Callback = function() W:Minimize() end})
+	section:Button({Text = "종료", Callback = function() W:Destroy() end})
+	local note = section:Label({Text = "다른 플레이어가 알을 구매해 기지로 가져가면 자동으로 이어집니다."})
+	local nextAt = 0
+	M.connect(env.run.Heartbeat, function()
+		if os.clock() < nextAt then return end
+		nextAt = os.clock() + 0.5
+		status:SetText((M.running and "실행 중 · " or "정지 · ") .. M.phase)
+		local best = M.best
+		target:SetText(best and best.owner.DisplayName .. "의 " .. best.raw .. "\n실제 계산 수익 " .. string.format("%.0f", best.cps) .. "/초" or "기지에 들어가면 수익·변종·크기·특성을 비교해 최고 펫을 고릅니다.")
+		local lines = {}
+		for i = math.max(1, #M.logs - 2), #M.logs do lines[#lines + 1] = M.logs[i] end
+		note:SetText(table.concat(lines, "\n"))
+	end)
+	return {status = status, choice = choice}
+end
+end)()
+factories["theft_entry"] = (function()
+return function(env)
+	function env.start()
+		assert(game.PlaceId == 97289366402005 and game.GameId == 10769384180, "현재 알 변신 게임 전용 스크립트입니다")
+		local UI = loadstring(game:HttpGet("https://raw.githubusercontent.com/eaf112/Script/refs/heads/main/ui-lib"))()
+		assert(UI and type(UI.CreateWindow) == "function", "지정 UI LIB를 불러오지 못했습니다")
+		local shared = getgenv()
+		local previous = shared.EGG_GAME_HUB
+		local previousTheft = previous and previous.env and previous.env.theft
+		local resume = previousTheft and previousTheft.running == true
+		local state = {}
+		if previousTheft then for _, key in ipairs({"pending", "cycle", "ownId", "lastFollowBase", "wasCarrying", "stealsBefore", "carryAt", "completed", "variant"}) do state[key] = previousTheft[key] end end
+		local selected = previous and previous.env and (previous.env.theft and previous.env.theft.selected or previous.env.egg and previous.env.egg.selectedDisguise)
+		if previous and previous.window then previous.window:Destroy() end
+		env.window = UI:CreateWindow({Id = "egg-game-helper", Title = "알 위장 자동 훔치기", Theme = "CodexDark", Locale = "ko", Width = 620, Height = 500, CloseBehavior = "Minimize"})
+		env.players, env.storage = game:GetService("Players"), game:GetService("ReplicatedStorage")
+		env.player, env.run = env.players.LocalPlayer, game:GetService("RunService")
+		local handle = {window = env.window, env = env, version = "2.1.1"}
+		shared.EGG_GAME_HUB = handle
+		env.window:OnDestroy(function() if shared.EGG_GAME_HUB == handle then shared.EGG_GAME_HUB = nil end end)
+		local ok, why = pcall(function()
+			env.theft = env.factories.theft(env)
+			for key, value in pairs(state) do env.theft[key] = value end
+			env.theft.selected = selected
+			env.view = env.factories.theft_view(env)
+			if resume then env.theft.motion.start(); env.theft.running = true; env.theft.phase = "텔레포트 방식으로 전환" end
+		end)
+		if not ok then env.window:Destroy(); error(why, 0) end
+		return {ready = true, version = "2.1.1", tabs = #env.window.Tabs, running = env.theft.running, movement = "teleport", purpose = "알 위장·기지 부화·최고 수익 펫 자동 훔치기"}
+	end
+	return env
+end
+end)()
+return factories.theft_entry({factories = factories}).start()
