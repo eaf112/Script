@@ -1,0 +1,1945 @@
+local options = ...
+
+local SkillRuntime = (function(env)
+	local M = {}
+	local forms = {
+		AlloAllo = {marker = "Allosaurus", pass = "ZXCVE", toggle = "V", up = "ZXCE"},
+		BrachioBrachio = {marker = "Brachiosaurus", pass = "ZXCVE", toggle = "V", up = "ZXCE"},
+		DemonDemon = {marker = "Demon_KL", pass = "ZXCVE", toggle = "V", up = "ZXCE"},
+		GasGas = {marker = "Gas_Model", pass = "ZXCV", up = "ZXCVE"},
+		GiraffeGiraffe = {marker = "Giraffe", pass = "ZXCV", required = "XCV", toggle = "Z", up = "XCV"},
+		MammothMammoth = {marker = "MammothModel", pass = "ZXCV", toggle = "V", up = "ZXC"},
+		PterPter = {marker = "Pteranodon_KL", pass = "ZXCVE", up = "ZXCE"},
+		ShadowShadow = {marker = "ShadowBear", pass = "E", up = "ZXC"},
+		SnowSnow = {marker = "Snow_Wing", pass = "E", up = "ZXCVE"},
+		SpinoSpino = {marker = "Spinosaurus", pass = "ZXCVE", toggle = "V", up = "ZXCE"},
+		ToyToy = {marker = "ToyTrex", pass = "ZXCVE", toggle = "E", up = "ZXCV"},
+		TreeTree = {marker = "Tree_KL", pass = "ZXCVE", toggle = "V", up = "ZXCE"},
+		VenomVenom = {marker = "DemonForm", pass = "ZXCVBE", toggle = "V", baseOnly = "B", up = "ZXCE"},
+		WolfWolf = {marker = "Wolf", pass = "ZXCV", required = "XCV", toggle = "Z", up = "XCV"},
+		BuddhaBuddha = {marker = "Buddha", pass = "ZXCVE", required = "XCVE", toggle = "Z", up = "XCVE"},
+		DragonDragon = {marker = "Dragon", pass = "ZXCVE", required = "E", toggle = "V", up = "ZXCE"},
+		HumanHuman = {marker = "Telekinesis_Model", pass = "ZXCV", up = "ZXCV"},
+		LeopardLeopard = {marker = "Leopard", pass = "ZXCVE", required = "XCVE", toggle = "Z", up = "XC"},
+		PhoenixPhoenix = {marker = "Phoenix_Model", pass = "ZXCVE", toggle = "V", up = "ZXCE"},
+	}
+	function M.Rule(name, key)
+		local form = forms[name]
+		if not form then return {} end
+		return {known = true, marker = form.marker, antiArg = form.pass:find(key, 1, true) and form.marker or nil,
+			requires = form.required and form.required:find(key, 1, true) and form.marker or nil,
+			baseOnly = form.baseOnly and form.baseOnly:find(key, 1, true) and form.marker or nil,
+			toggle = form.toggle == key, expectUp = form.up:find(key, 1, true) ~= nil}
+	end
+	function M.ExpectsUp(name, key)
+		if forms[name] then return M.Rule(name, key).expectUp end
+		local held = {RumbleRumble = "ZXCVE", Acrodagger = "ZX", ["Gale Fist"] = "ZXCV"}
+		if held[name] then return held[name]:find(key, 1, true) ~= nil end
+	end
+	function M.Registered(data, key, fn)
+		return type(key) == "string" and key:match("^[A-Z]$") ~= nil and type(fn) == "function"
+			and (type(data[key]) == "number" or type(data[key .. "Require"]) == "number")
+	end
+	function M.ResolveName(name, dfName, exists)
+		if exists(name) then return name end
+		local form = forms[dfName]
+		if form and name == form.marker and exists(dfName) then return dfName end
+	end
+	function M.FormNames() local result = {}; for name, form in pairs(forms) do result[name] = form.marker end; return result end
+	function M.Preset(value) return value == "ThunderGale" and value or "Universal" end
+	function M.AwakeningSignature(misc)
+		local values = {}
+		for key, value in pairs(misc) do
+			if type(value) == "boolean" then values[#values + 1] = tostring(key) .. "=" .. tostring(value) end
+		end
+		table.sort(values)
+		return table.concat(values, "|")
+	end
+	function M.SpecialReady(skills)
+		local names = {}
+		for _, skill in ipairs(skills) do names[skill.name or skill.tool.Name] = true end
+		return names.RumbleRumble and names.Acrodagger and names["Gale Fist"] or false
+	end
+	return M
+end)({})
+if type(options) == "table" and options.TestRuntime then return SkillRuntime end
+
+local ComboPlanner = (function(env)
+	local M = {}
+	-- 운용 거리는 연계 선택 기준이며 서버 판정 사거리는 아닙니다.
+	local profiles = {
+		RumbleRumble = {
+			Z = {kind = "quick", priority = 100, recovery = 0.26, label = "빠른 견제"},
+			X = {kind = "burst", priority = 78, recovery = 0.28, charge = 0.72, label = "후속 공격"},
+			C = {kind = "quick", priority = 66, recovery = 0.27, label = "후속 공격"},
+			V = {kind = "finish", priority = 52, recovery = 0.3, charge = 3.02, label = "큰 기술 연결"},
+			E = {kind = "utility", priority = 25, recovery = 0.3, charge = 1.02, label = "상황 기술"},
+		},
+		Trickster = {
+			Z = {kind = "quick", priority = 85, recovery = 0.18, label = "빠른 후속기", limit = 65},
+			X = {kind = "dash", priority = 75, recovery = 0.2, label = "거리 좁히기", limit = 180},
+			C = {kind = "channel", priority = 58, recovery = 0.25, channel = 2, label = "지속 공격", limit = 90},
+			V = {kind = "finish", priority = 65, recovery = 0.25, label = "후속 공격", limit = 90},
+			E = {kind = "burst", priority = 60, recovery = 0.25, label = "후속 공격", limit = 90},
+		},
+		Acrodagger = {
+			Z = {kind = "quick", priority = 90, recovery = 0.14, hold = 0.04, label = "빠르게 놓기"},
+			X = {kind = "catch", priority = 95, recovery = 0.27, label = "대상 지정 후속기", limit = 250},
+		},
+	}
+	function M.Profile(tool, key, awake, metadata)
+		local source = profiles[tool] and profiles[tool][key]
+		local meta = metadata or {}
+		local cooldown = tonumber(meta.cooldown) or 8
+		local profile = {kind = "quick", priority = math.max(25, math.min(90, 95 - cooldown * 3)), recovery = 0.2, hold = 0.05,
+			label = "자동 분석 후속기", source = "게임 스킬 데이터", cooldown = cooldown}
+		local hints = (meta.hints or ""):lower()
+		if hints:find("findnearesttarget", 1, true) then
+			profile.kind, profile.priority, profile.label = "catch", 92, "대상 지정 후속기"
+		elseif hints:find("shambles", 1, true) or hints:find("teleport", 1, true) or hints:find("dash", 1, true) then
+			profile.kind, profile.label = "dash", "이동 기술 연결"
+		elseif hints:find("charge", 1, true) or hints:find("hold", 1, true) then
+			profile.kind, profile.label = "charge", "짧게 놓는 후속기"
+		end
+		if source then for k, v in pairs(source) do profile[k] = v end end
+		if source then profile.source = "확인한 기술별 설정" end
+		if tool == "OpOp" and key == "Z" then
+			profile.kind, profile.priority, profile.label = "setup", 180, "룸 준비"
+		end
+		if tool == "RumbleRumble" then
+			if key == "C" and awake then profile.kind, profile.label, profile.limit = "dash", "거리 좁히기", 240 end
+			if not awake then profile.charge = nil end
+		end
+		return profile
+	end
+	function M.IsCanceled(alive, stopped, capturedEpoch, currentEpoch, autoToken, autoEnabled, autoEpoch)
+		return not alive or stopped or capturedEpoch ~= currentEpoch
+			or autoToken ~= nil and (not autoEnabled or autoToken ~= autoEpoch)
+	end
+	function M.Duel(localName, friendly, opponentName, opponentFriendly, opponentSolo)
+		if friendly ~= true then return {active = false, ready = false} end
+		local named = type(opponentName) == "string" and opponentName ~= "" and opponentName ~= localName
+		local ready = named and opponentFriendly == true and opponentSolo == localName
+		return {active = true, name = named and opponentName or nil, ready = ready == true,
+			reason = ready and "결투 상대 고정" or "결투 상대 확인 대기"}
+	end
+	function M.DuelCastBlocked(capturedEpoch, currentEpoch, protected, active, hasHit)
+		return capturedEpoch ~= currentEpoch or (protected or active) and not hasHit
+	end
+	function M.HoldReady(cast, hold, now)
+		return now >= (cast.downAt or cast.started + 0.5) + hold
+	end
+	function M.StraightMove(name, key, awake)
+		return key == "C" and (name == "Gale Fist" or name == "RumbleRumble" and awake == true)
+	end
+	function M.ForwardAnchor(position, heading) return position + heading * 1000 end
+	function M.SteerDrag(launch, heading, delta, elapsed)
+		if not delta or delta.Magnitude > 180 then return heading end
+		local lateral = delta - launch * delta:Dot(launch)
+		local offset = lateral.Magnitude
+		local desired = launch
+		if offset > 3 then
+			desired = (launch + lateral.Unit * math.min((offset - 3) / 90, math.tan(math.rad(22)))).Unit
+		end
+		local angle = math.acos(math.max(-1, math.min(1, heading:Dot(desired))))
+		local step = math.min(angle, math.rad(40) * math.max(0, math.min(elapsed, 0.05)))
+		if angle < 0.00001 or step <= 0 then return heading end
+		if step >= angle then return desired end
+		return (heading * (math.sin(angle - step) / math.sin(angle)) + desired * (math.sin(step) / math.sin(angle))).Unit
+	end
+	function M.CanAdvance(cast, decision, now, doing, charging)
+		if not cast.released or not (cast.upAt or cast.expectUp ~= true and cast.callReturned and cast.downAt) or doing or charging then return false end
+		local releasedAt = cast.releasedAt or now
+		return now >= math.max(releasedAt, cast.upAt or releasedAt) + decision.recovery
+	end
+
+	function M.Choose(skills, context)
+		local diagnostics = {skills = {}, count = #skills}
+		if not context.valid then return nil, "조준 대상 대기", diagnostics end
+		if context.distance > (context.aimRange or context.maxDistance) then return nil, "조준 거리 밖", diagnostics end
+		local chosen, decision, highest
+		for _, skill in ipairs(skills) do
+			local p, distance = skill.profile, context.distance
+			local eligible, preferred = true, true
+			local hold, score, role = p.hold or 0.05, p.priority, p.label
+			local notes = {}
+			local function prefer(condition, penalty, reason)
+				if not condition then
+					preferred = false
+					score = score - penalty
+					notes[#notes + 1] = reason
+				end
+			end
+			prefer(distance <= context.maxDistance, math.min(100, math.max(0, distance - context.maxDistance) / 8), "콤보 우선 거리 밖")
+			if p.limit then prefer(distance <= p.limit, math.min(50, math.max(0, distance - p.limit) / 6), "스킬 우선 거리 밖") end
+			local feedback = context.feedback[skill.settingId]
+			local ccRate = feedback and feedback.cc / math.max(1, feedback.attempts) or 0
+			if p.kind == "dash" then
+				if not context.allowDash then eligible = false; notes[#notes + 1] = "돌진 사용 설정 꺼짐" end
+				prefer(distance > 55 and not context.stunned, 80, "근접 돌진 후순위")
+				score = score + (distance > 90 and 45 or -20)
+			elseif p.kind == "channel" then
+				prefer(context.stunned and context.remaining >= 0.45, 35, "경직 연계 후순위")
+				score = score + 15
+			elseif p.kind == "unknown" or p.kind == "utility" then
+				prefer(context.stunned and context.remaining > 0.6 and distance < 65, 30, "남은 스킬로 연결")
+			elseif p.kind == "finish" then
+				prefer(context.stunned or context.healthRatio <= 0.22, 45, "마무리 우선 조건 아님")
+				score = score + (context.healthRatio <= 0.22 and 45 or 0)
+			end
+			if context.stunned then
+				if p.kind == "burst" or p.kind == "charge" or p.kind == "catch" then score = score + 35 end
+				if ccRate > 0.2 then score = score + (context.remaining < 0.3 and 35 or -25) end
+				if p.charge and context.remaining >= p.charge + 0.22 then hold, role, score = p.charge, "경직 중 차징", score + 35 end
+			else
+				score = score + ccRate * 55
+				if p.kind == "quick" or p.kind == "catch" then score = score + 15 end
+			end
+			if context.lastSkill == skill.settingId then score = score - 40 end
+			local elapsed = context.now - (context.lastUse[skill.settingId] or -100)
+			if elapsed < 0.1 then eligible = false; notes[#notes + 1] = "중복 입력 잠깐 대기" end
+			diagnostics.skills[skill.settingId] = {eligible = eligible, preferred = preferred, score = score, reason = table.concat(notes, " · ")}
+			if eligible and (not highest or score > highest or score == highest and skill.settingId < chosen.settingId) then
+				chosen, highest = skill, score
+				decision = {
+					hold = hold, recovery = p.recovery, channel = p.channel or 0,
+					role = preferred and role or ("남은 스킬 연결 · " .. p.label), score = score, fallback = not preferred,
+				}
+			end
+		end
+		diagnostics.selected = chosen and chosen.settingId or nil
+		return chosen, decision or "사용 조건을 만족하는 스킬 대기", diagnostics
+	end
+	function M.ChooseStorm(skills, context)
+		local choices = {}
+		for _, skill in ipairs(skills) do
+			local copy, p = {}, {}
+			for key, value in pairs(skill) do copy[key] = value end
+			for key, value in pairs(skill.profile) do p[key] = value end
+			copy.profile, copy.original = p, skill
+			local name, key = skill.name or skill.tool.Name, skill.key
+			local confirmed = context.stunned or context.recentHit
+			if name == "RumbleRumble" then
+				if key == "Z" then p.priority, p.label = context.stunned and 70 or 190, "번개 견제·경직 확인"
+				elseif key == "C" then p.priority, p.label = context.distance > 80 and 125 or 25, "번개로 간격 좁히기"
+				elseif key == "X" then p.priority, p.label = confirmed and 145 or 95, "경직 뒤 번개 연결"
+				elseif key == "V" then p.priority, p.label = confirmed and context.healthRatio < 0.35 and 160 or 55, "번개 광역 마무리"
+				elseif key == "E" then p.priority = context.airborne and 85 or 30 end
+			elseif name == "Acrodagger" then
+				if key == "X" then p.priority, p.label = confirmed and 185 or 110, "아크로대거 대상 추격"
+				elseif key == "Z" then p.priority, p.label = confirmed and context.distance < 130 and 225 or 115, "아크로대거 주력 피해" end
+			elseif name == "Gale Fist" then
+				p.hold, p.recovery = 0.05, 0.2
+				if key == "Z" then
+					p.kind, p.priority, p.label = "catch", (context.airborne or context.knockback > 22) and 165 or 90, "게일로 공중 연결"
+				elseif key == "X" then
+					p.kind, p.priority, p.label = "burst", confirmed and context.distance < 100 and 150 or 80, "게일 후속 공격"
+				elseif key == "C" then
+					p.kind, p.recovery, p.label = "dash", 0.95, "회오리 진입·공중 추적"
+					p.priority = context.distance > 100 and (context.airborne or context.knockback > 22) and 175 or 35
+				elseif key == "V" then p.kind, p.priority, p.label = "burst", confirmed and 130 or 60, "회오리 연계"
+				elseif key == "E" then
+					p.kind, p.priority, p.label = "utility", context.enemyDoing and context.distance < 75 and 260 or 15, "근접 반격"
+				end
+			end
+			choices[#choices + 1] = copy
+		end
+		local chosen, decision, diagnostics = M.Choose(choices, context)
+		if chosen then decision.preset = "ThunderGale" end
+		return chosen and chosen.original or nil, decision, diagnostics
+	end
+
+	return M
+end)({})
+if type(options) == "table" and options.TestPlanner then return ComboPlanner end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local player = Players.LocalPlayer
+assert(game.GameId == 1451439645, "현재 체험용 스킬 버튼입니다")
+assert(type(getsenv) == "function", "이 실행기는 게임 환경 조회를 지원하지 않습니다")
+
+local RS = game:GetService("ReplicatedStorage")
+local handler = player:WaitForChild("PlayerScripts"):WaitForChild("Services"):WaitForChild("ClientSkillHandler")
+local gameG = getsenv(handler)._G
+local requirement = require(RS.Chest.Modules.Requirement)
+local families = {
+	{folder = "FruitSkills", data = "Fruits", prefix = "DF", stat = "DF", slot = "DFName"},
+	{folder = "SwordSkills", data = "Swords", prefix = "SW", stat = "sword", slot = "SwordName"},
+	{folder = "FightingStyleSkills", data = "Styles", prefix = "FS", stat = "Melee", slot = "FightingStyle"},
+}
+local HttpService = game:GetService("HttpService")
+local env = type(getgenv) == "function" and getgenv() or _G
+local settingsKey = "RandomSkillButtonSettings_" .. tostring(player.UserId)
+local settingsFile = "random_skill_button_settings_" .. tostring(player.UserId) .. ".json"
+local config = {version = 1, x = 83.4, y = 50, excluded = {}, aimEnabled = true, aimMode = "NPC", aimRange = 1000, comboEnabled = true, comboDistance = 180, comboDash = true, comboPreset = "Universal"}
+local loadError
+local function percent(value, fallback)
+	local number = tonumber(value)
+	if not number or number ~= number or math.abs(number) == math.huge then return fallback end
+	return math.clamp(number, 0, 100)
+end
+local stored = env[settingsKey]
+if type(stored) ~= "table" and type(readfile) == "function" and type(isfile) == "function" then
+	local ok, value = pcall(function()
+		if isfile(settingsFile) then return HttpService:JSONDecode(readfile(settingsFile)) end
+	end)
+	if ok then stored = value else loadError = tostring(value) end
+end
+if type(stored) == "table" then
+	config.x, config.y = percent(stored.x, config.x), percent(stored.y, config.y)
+	if type(stored.aimEnabled) == "boolean" then config.aimEnabled = stored.aimEnabled end
+	if stored.aimMode == "Player" or stored.aimMode == "NPC" then config.aimMode = stored.aimMode end
+	local range = tonumber(stored.aimRange)
+	if range and range == range and math.abs(range) < math.huge then config.aimRange = math.clamp(range, 50, 3000) end
+
+	if type(stored.comboEnabled) == "boolean" then config.comboEnabled = stored.comboEnabled end
+	config.comboPreset = SkillRuntime.Preset(stored.comboPreset)
+	if type(stored.comboDash) == "boolean" then config.comboDash = stored.comboDash end
+	local comboDistance = tonumber(stored.comboDistance)
+	if comboDistance and comboDistance == comboDistance and math.abs(comboDistance) < math.huge then config.comboDistance = math.clamp(comboDistance, 25, 300) end
+	if type(stored.excluded) == "table" then
+		for id, value in pairs(stored.excluded) do
+			if type(id) == "string" and id:match("^.+::[A-Z]$") and value == true then config.excluded[id] = true end
+		end
+	end
+end
+env[settingsKey] = config
+
+local skillState = {revision = 0, nextScan = 0, dirty = true, retry = {}, forms = {}, rebuilds = 0, error = nil}
+local strategyEpoch = 0
+-- 현재 관측 중인 인스턴스 래퍼의 GC로 동일 객체가 교체된 것으로 오인하지 않게 합니다.
+local objectIds, identitySeen, nextObjectId = {}, {}, 0
+local skillStateChanged
+local function identity(object)
+	if not object then return "없음" end
+	identitySeen[object] = true
+	if not objectIds[object] then nextObjectId = nextObjectId + 1; objectIds[object] = nextObjectId end
+	return tostring(objectIds[object])
+end
+local function statName(name)
+	local stats = player:FindFirstChild("PlayerStats")
+	local value = stats and stats:FindFirstChild(name)
+	return value and tostring(value.Value) or ""
+end
+local antiForms = require(RS.Chest.Modules.AntiMobSkill)
+local function refreshSkillState(force)
+	local now = os.clock()
+	if not force and not skillState.dirty and now < skillState.nextScan then return false end
+	skillState.dirty, skillState.nextScan = false, now + 0.2
+	identitySeen = {}
+	local scripts = player:FindFirstChild("PlayerScripts")
+	local services = scripts and scripts:FindFirstChild("Services")
+	local currentHandler = services and services:FindFirstChild("ClientSkillHandler")
+	skillState.unavailable = not currentHandler or not player:FindFirstChildOfClass("Backpack")
+	if currentHandler then
+		local ok, scope = pcall(getsenv, currentHandler)
+		if ok and type(scope) == "table" and type(scope._G) == "table" then handler, gameG = currentHandler, scope._G else skillState.unavailable = true end
+	end
+	if type(gameG.Cooldowns) ~= "table" or type(gameG.CheckStunClient) ~= "function" or type(gameG.CheckDoingClient) ~= "function"
+		or type(gameG.AntiMobSkill) ~= "function" then skillState.unavailable = true end
+	local miscRaw = statName("Misc")
+	if miscRaw ~= skillState.miscRaw then
+		local ok, misc = pcall(HttpService.JSONDecode, HttpService, miscRaw)
+		if ok and type(misc) == "table" then
+			skillState.miscRaw, skillState.miscSignature = miscRaw, SkillRuntime.AwakeningSignature(misc)
+		end
+	end
+	local pieces = {identity(player.Character), identity(currentHandler), identity(gameG), tostring(skillState.unavailable), statName("DFName"), statName("SwordName"), statName("FightingStyle"), skillState.miscSignature or ""}
+	local forms = {}
+	local character = player.Character
+	if character then
+		for name in pairs(antiForms) do
+			local marker = character:FindFirstChild(name)
+			if marker then forms[#forms + 1] = name; pieces[#pieces + 1] = name .. ":" .. identity(marker) end
+		end
+	end
+	for _, root in pairs({player:FindFirstChildOfClass("Backpack"), character}) do
+		for _, tool in ipairs(root:GetChildren()) do
+			if tool:IsA("Tool") then
+				pieces[#pieces + 1] = "장비:" .. identity(tool) .. ":" .. tool.Name
+			end
+		end
+	end
+	for _, family in ipairs(families) do
+		local folder = handler:FindFirstChild(family.folder)
+		pieces[#pieces + 1] = family.folder .. ":" .. identity(folder)
+		if folder then
+			for _, source in ipairs(folder:GetChildren()) do pieces[#pieces + 1] = identity(source) .. ":" .. source.Name end
+		end
+	end
+	table.sort(forms)
+	table.sort(pieces)
+	for object in pairs(objectIds) do if not identitySeen[object] then objectIds[object] = nil end end
+	local signature = table.concat(pieces, "|")
+	if signature == skillState.signature then return false end
+	skillState.signature, skillState.forms = signature, forms
+	skillState.revision, skillState.rebuilds = skillState.revision + 1, skillState.rebuilds + 1
+	skillState.retry, skillState.error = {}, nil
+	if skillStateChanged then skillStateChanged() end
+	return true
+end
+
+local function characterReady()
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then return nil, "부활 대기" end
+	if skillState.unavailable then return nil, "스킬 모듈 준비 중" end
+	if humanoid.Sit then return nil, "앉아 있는 중" end
+	if config.comboEnabled and character:FindFirstChild("ChargeFolder") then return nil, "돌진 마무리" end
+	if gameG.CheckStunClient(player) then return nil, "기절 중" end
+	if gameG.CheckDoingClient(player) then return nil, "동작 중" end
+	return humanoid
+end
+
+
+local function allowed(skill)
+	if config.excluded[skill.settingId] then return false, "제외 설정" end
+	if skill.revision ~= skillState.revision or skill.source.Parent == nil or skill.module[skill.key] ~= skill.fn then return false, "스킬 구성 갱신 대기" end
+	if skill.dataSource and (not skill.dataSource.Parent or skill.dataFolder:FindFirstChild(skill.name .. "_Data") ~= skill.dataSource) then return false, "스킬 데이터 갱신 대기" end
+	if not skill.tool.Parent or skill.tool.Parent ~= player.Backpack and skill.tool.Parent ~= player.Character then return false, "장비 미소지" end
+	if skill.family.slot and statName(skill.family.slot) ~= skill.name then return false, "현재 장비 식별자 갱신 대기" end
+	if os.clock() < (skillState.retry[skill.settingId] or 0) then return false, "게임 조건 재확인 대기" end
+	local rule = SkillRuntime.Rule(skill.name, skill.key)
+	local character = player.Character
+	if not character then return false, "부활 대기" end
+	if rule.requires and not character:FindFirstChild(rule.requires) then return false, "변신 필요" end
+	if rule.baseOnly and character:FindFirstChild(rule.baseOnly) then return false, "기본 모습에서 사용" end
+	if rule.toggle and character:FindFirstChild(rule.marker) then return false, "변신 유지" end
+	if rule.known or skill.family.prefix ~= "DF" then
+		local ok, blocked = pcall(gameG.AntiMobSkill, rule.antiArg)
+		if not ok then return false, "변신 조건 조회 실패" end
+		if blocked then return false, "현재 변신에서 사용할 수 없음" end
+	end
+	if gameG.Cooldowns[skill.id] then return false, "쿨다운" end
+	local stat = player.PlayerStats:FindFirstChild(skill.family.stat)
+	local needed = tonumber(skill.data[skill.key .. "Require"])
+	if needed and (not stat or stat.Value < needed) then return false, "요구 능력치 부족" end
+	local rules = requirement[skill.name]
+	if type(rules) == "table" and type(rules[skill.key]) == "function" then
+		local ok, canUse = pcall(rules[skill.key], player)
+		if not ok then return false, "스킬 사용 조건 조회 실패" end
+		if not canUse then return false, "게임 스킬 사용 조건" end
+	end
+	if skill.name == "OpOp" then
+		local room = workspace:FindFirstChild("OpeRoom" .. player.Name)
+		if skill.key == "Z" then
+			if config.comboEnabled and room then return false, "룸 유지" end
+		elseif not room then return false, "룸 필요" end
+	end
+	return true, "사용 가능"
+end
+
+local function candidates(includeBlocked)
+	refreshSkillState()
+	if skillState.unavailable then return {} end
+	local result, seen = {}, {}
+	for _,root in pairs({player:FindFirstChildOfClass("Backpack"), player.Character}) do
+		if root then
+			for _,tool in ipairs(root:GetChildren()) do
+				if tool:IsA("Tool") and not seen[tool] then
+					seen[tool] = true
+					for _,family in ipairs(families) do
+						local folder = handler:FindFirstChild(family.folder)
+						local name = SkillRuntime.ResolveName(tool.Name, family.prefix == "DF" and statName("DFName") or "", function(value)
+							return folder and folder:FindFirstChild(value .. "_Client") ~= nil
+						end)
+						local source = name and folder:FindFirstChild(name .. "_Client")
+						local dataSource = name and RS.Chest.Modules.SkillData[family.data]:FindFirstChild(name .. "_Data")
+						if source and dataSource then
+							local ok, module = pcall(require, source)
+							local dataOK, data = pcall(require, dataSource)
+							if ok and dataOK and type(module) == "table" and type(data) == "table" then
+								for key, fn in pairs(module) do
+									if SkillRuntime.Registered(data, key, fn) then
+										local skill = {tool = tool, name = name, source = source, dataSource = dataSource,
+											dataFolder = RS.Chest.Modules.SkillData[family.data], fn = fn, revision = skillState.revision,
+											family = family, data = data, module = module, key = key, id = family.prefix .. key, settingId = name .. "::" .. key}
+										if includeBlocked or allowed(skill) then result[#result + 1] = skill end
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return result
+end
+
+if type(options) == "table" and options.Diagnostic then
+	local skills = {}
+	for _,skill in ipairs(candidates()) do skills[#skills + 1] = skill.tool.Name .. " " .. skill.key end
+	table.sort(skills)
+	local humanoid, reason = characterReady()
+	return {available = skills, ready = humanoid ~= nil, reason = reason, settings = {x = config.x, y = config.y, excluded = config.excluded}}
+end
+
+local loaded, UI = pcall(function()
+	return loadstring(game:HttpGet("https://raw.githubusercontent.com/eaf112/Script/refs/heads/main/ui-lib"))()
+end)
+assert(loaded and type(UI) == "table" and type(UI.CreateWindow) == "function", "설정 UI 로드 실패: " .. tostring(UI))
+local key = "RandomSkillButton"
+local old = env[key]
+if type(old) == "table" and type(old.Destroy) == "function" then old:Destroy() end
+local api = {}
+local alive, busy = true, false
+local stopped, stopEpoch = false, 0
+local activeCast, lastSkill
+local connections = {}
+local characterConnections = {}
+local window, saveLabel, excludedControl, xControl, yControl, autoControl
+local aimControl, aimModeControl, aimRangeControl, targetLabel
+local comboControl, comboDistanceControl, comboDashControl, comboLabel, presetControl, presetLabel, formLabel
+local duelLabel
+local duelState = {active = false, ready = false, epoch = 0}
+local autoEnabled, autoQueued, autoEpoch = false, false, 0
+local nextAuto, autoCastCount = 0, 0
+local saveSerial, dirty, saveError = 0, false, loadError
+local random = Random.new()
+local statusSerial = 0
+local displayed = "스킬 사용"
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "RandomSkillButton"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 120
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+local canvas = Instance.new("Frame")
+canvas.Name = "Canvas"
+canvas.Size = UDim2.fromScale(1, 1)
+canvas.BackgroundTransparency = 1
+canvas.Parent = gui
+local button = Instance.new("TextButton")
+button.Name = "UseSkill"
+button.Size = UDim2.fromOffset(72, 72)
+button.AnchorPoint = Vector2.new(0.5, 0.5)
+button.Position = UDim2.new(config.x / 100, (0.5 - config.x / 100) * 72, config.y / 100, (0.5 - config.y / 100) * 72)
+button.BackgroundColor3 = Color3.fromRGB(12, 13, 13)
+button.BackgroundTransparency = 0.32
+button.BorderSizePixel = 0
+button.TextColor3 = Color3.fromRGB(242, 245, 252)
+button.TextSize = 15
+button.Font = Enum.Font.GothamBold
+button.Text = ""
+button.TextWrapped = true
+button.AutoButtonColor = true
+button.Active = true
+button.Parent = canvas
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(1, 0)
+corner.Parent = button
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(225, 223, 211)
+stroke.Thickness = 1.6
+stroke.Transparency = 0.23
+stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+stroke.Parent = button
+local title = Instance.new("TextLabel")
+title.Name = "Title"
+title.BackgroundTransparency = 1
+title.Position = UDim2.fromScale(0.08, 0.20)
+title.Size = UDim2.fromScale(0.84, 0.36)
+title.Font = Enum.Font.GothamBold
+title.Text = config.comboEnabled and "연계" or "스킬"
+title.TextSize = 18
+title.TextColor3 = Color3.new(1, 1, 1)
+title.TextStrokeTransparency = 0.25
+title.TextStrokeColor3 = Color3.new(0, 0, 0)
+title.Parent = button
+local caption = Instance.new("TextLabel")
+caption.Name = "Caption"
+caption.BackgroundTransparency = 1
+caption.Position = UDim2.fromScale(0.10, 0.57)
+caption.Size = UDim2.fromScale(0.80, 0.22)
+caption.Font = Enum.Font.GothamBold
+caption.Text = config.comboEnabled and "콤보" or "무작위"
+caption.TextSize = 11
+caption.TextColor3 = Color3.fromRGB(222, 219, 206)
+caption.TextStrokeTransparency = 0.2
+caption.TextScaled = true
+caption.Parent = button
+local textLimit = Instance.new("UITextSizeConstraint")
+textLimit.MinTextSize = 8
+textLimit.MaxTextSize = 12
+textLimit.Parent = caption
+local nativeSkills = player.PlayerGui:FindFirstChild("SkillCooldown")
+local nativeLabel = nativeSkills and nativeSkills:FindFirstChild("SkillsNames", true)
+if nativeLabel and nativeLabel:IsA("TextLabel") then
+	title.FontFace = nativeLabel.FontFace
+	caption.FontFace = nativeLabel.FontFace
+end
+
+local parent = player:WaitForChild("PlayerGui")
+if type(gethui) == "function" then
+	local ok, value = pcall(gethui)
+	if ok and typeof(value) == "Instance" then parent = value end
+end
+gui.Parent = parent
+
+local function connect(signal, callback)
+	connections[#connections + 1] = signal:Connect(callback)
+end
+
+
+local autoButton = Instance.new("TextButton")
+autoButton.Name = "ToggleAuto"
+autoButton.Size = UDim2.fromOffset(80, 28)
+autoButton.BackgroundColor3 = Color3.fromRGB(18, 21, 22)
+autoButton.BackgroundTransparency = 0.15
+autoButton.BorderSizePixel = 0
+autoButton.Text = "자동 꺼짐"
+autoButton.TextColor3 = Color3.fromRGB(225, 223, 211)
+autoButton.Font = Enum.Font.GothamBold
+autoButton.TextSize = 12
+autoButton.Active = true
+autoButton.AutoButtonColor = true
+autoButton.Parent = canvas
+local autoCorner = Instance.new("UICorner")
+autoCorner.CornerRadius = UDim.new(0, 8)
+autoCorner.Parent = autoButton
+local autoStroke = Instance.new("UIStroke")
+autoStroke.Color = Color3.fromRGB(125, 128, 122)
+autoStroke.Transparency = 0.25
+autoStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+autoStroke.Parent = autoButton
+
+
+local modeButton = Instance.new("TextButton")
+modeButton.Name = "ToggleAimMode"
+modeButton.Size = UDim2.fromOffset(112, 28)
+modeButton.BackgroundColor3 = Color3.fromRGB(18, 21, 22)
+modeButton.BackgroundTransparency = 0.15
+modeButton.BorderSizePixel = 0
+modeButton.Font = Enum.Font.GothamBold
+modeButton.TextSize = 12
+modeButton.Active = true
+modeButton.AutoButtonColor = true
+modeButton.Parent = canvas
+local modeCorner = Instance.new("UICorner")
+modeCorner.CornerRadius = UDim.new(0, 8)
+modeCorner.Parent = modeButton
+local modeStroke = Instance.new("UIStroke")
+modeStroke.Transparency = 0.25
+modeStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+modeStroke.Parent = modeButton
+
+
+local stopButton = Instance.new("TextButton")
+stopButton.Name = "StopNow"
+stopButton.Size = UDim2.fromOffset(112, 32)
+stopButton.BackgroundColor3 = Color3.fromRGB(150, 42, 48)
+stopButton.BackgroundTransparency = 0.05
+stopButton.BorderSizePixel = 0
+stopButton.Font = Enum.Font.GothamBold
+stopButton.Text = "즉시 중지"
+stopButton.TextColor3 = Color3.fromRGB(255, 243, 243)
+stopButton.TextSize = 13
+stopButton.Active = true
+stopButton.AutoButtonColor = true
+stopButton.Parent = canvas
+local stopCorner = Instance.new("UICorner")
+stopCorner.CornerRadius = UDim.new(0, 8)
+stopCorner.Parent = stopButton
+
+local function paintStop()
+	stopButton.Text = stopped and "중지 해제" or "즉시 중지"
+	stopButton.BackgroundColor3 = stopped and Color3.fromRGB(36, 93, 64) or Color3.fromRGB(150, 42, 48)
+end
+
+local function paintAimMode()
+	if duelState.active then
+		modeButton.Text = "결투 상대 고정"
+		modeButton.TextColor3, modeStroke.Color = Color3.fromRGB(255, 196, 105), Color3.fromRGB(255, 196, 105)
+		return
+	end
+	local isPlayer = config.aimMode == "Player"
+	modeButton.Text = isPlayer and "가까운 플레이어" or "가까운 NPC"
+	local color = isPlayer and Color3.fromRGB(155, 205, 255) or Color3.fromRGB(150, 255, 175)
+	modeButton.TextColor3, modeStroke.Color = color, color
+end
+paintAimMode()
+
+local function layoutAutoButton()
+	local size = canvas.AbsoluteSize
+	if size.X <= 0 or size.Y <= 0 then return end
+	local centerX = button.Position.X.Scale * size.X + button.Position.X.Offset
+	local centerY = button.Position.Y.Scale * size.Y + button.Position.Y.Offset
+	local top = centerY + 42
+	if top + 28 > size.Y - 4 then top = centerY - 70 end
+	autoButton.Position = UDim2.fromOffset(
+		math.clamp(centerX - 40, 4, math.max(4, size.X - 84)),
+		math.clamp(top, 4, math.max(4, size.Y - 32))
+	)
+	local autoLeft, autoTop = autoButton.Position.X.Offset, autoButton.Position.Y.Offset
+	local modeLeft = autoLeft - 118
+	if modeLeft < 4 and autoLeft + 198 <= size.X - 4 then modeLeft = autoLeft + 86 end
+	modeButton.Position = UDim2.fromOffset(math.clamp(modeLeft, 4, math.max(4, size.X - 116)), autoTop)
+	local stopTop = autoTop - 38
+	if stopTop < 4 then stopTop = autoTop + 34 end
+	stopButton.Position = UDim2.fromOffset(modeButton.Position.X.Offset, math.clamp(stopTop, 4, math.max(4, size.Y - 36)))
+end
+
+local function show(text, seconds)
+	if stopped then text, seconds = "중지됨", nil end
+	statusSerial = statusSerial + 1
+	local serial = statusSerial
+	if not alive then return end
+	displayed = text
+	caption.Text = text == "스킬 사용" and (config.comboEnabled and "콤보" or "무작위") or text
+	stroke.Color = busy and Color3.fromRGB(245, 211, 132) or Color3.fromRGB(225, 223, 211)
+	if seconds then
+		task.delay(seconds, function()
+			if alive and serial == statusSerial and not busy then displayed = "스킬 사용" caption.Text = "무작위" end
+		end)
+	end
+end
+
+local function release(cast)
+	if cast and not cast.released then
+		cast.released = true
+		if type(cast.skill.module.Deactive) == "function" then pcall(cast.skill.module.Deactive, cast.skill.key) end
+	end
+end
+
+local doingScope, doingOriginal, doingWrapper
+local function detachDoingTracker()
+	if doingScope and doingScope.InstanceDoingClient == doingWrapper then doingScope.InstanceDoingClient = doingOriginal end
+	doingScope, doingOriginal, doingWrapper = nil, nil, nil
+end
+local function ensureDoingTracker()
+	if doingScope == gameG and gameG.InstanceDoingClient == doingWrapper then return end
+	detachDoingTracker()
+	if type(gameG.InstanceDoingClient) ~= "function" then return end
+	doingScope, doingOriginal = gameG, gameG.InstanceDoingClient
+	local original = doingOriginal
+	doingWrapper = function(...)
+		local token = original(...)
+		local cast = activeCast
+		if cast and cast.nativeThread == coroutine.running() and type(token) == "table" then
+			cast.doingTokens[#cast.doingTokens + 1] = {token = token, object = token.Object}
+		end
+		return token
+	end
+	doingScope.InstanceDoingClient = doingWrapper
+end
+local function cleanupOwnDoing(cast)
+	if not cast then return end
+	for _, entry in ipairs(cast.doingTokens or {}) do
+		local object, token = entry.object, entry.token
+		if typeof(object) == "Instance" and object.Parent == cast.character and object.Name == "TotalDoing"
+			and token.Object == object and type(token.Delete) == "function" then pcall(token.Delete, token) end
+	end
+end
+
+
+local comboState = {
+	target = nil, expires = 0, epoch = 0, pending = nil, phase = "대상 대기",
+	lastSkill = nil, lastUse = {}, feedback = {}, wasStunned = false,
+	stunStart = nil, stunDuration = nil, sampled = nil, lastLabel = 0, steps = 0, history = {},
+}
+
+local aimTarget, aimPart, aimCell, previousAimCell, aimError, legacyAimCell, aimScope
+local aimDistance, aimScanAt, aimRewrites = nil, 0, 0
+local straightAim
+local straightStats = {casts = 0, samples = 0, minForwardDot = 1}
+local lastAimHit, baseAimHit, baseAimMobile, baseAimLegacy
+local mobileWrapper, originalMobile, mouseWrapper, originalMouse
+local npcHumanoids = {}
+local skillFunctions = RS.Chest.Remotes:FindFirstChild("Functions")
+local skillRemote = skillFunctions and skillFunctions:FindFirstChild("SkillAction")
+local aimSupported = type(hookmetamethod) == "function" and type(newcclosure) == "function"
+	and type(getnamecallmethod) == "function" and type(setnamecallmethod) == "function"
+	and skillRemote and skillRemote:IsA("RemoteFunction")
+local targetMark = Instance.new("Highlight")
+targetMark.Name = "스킬_조준_대상"
+targetMark.DepthMode = Enum.HighlightDepthMode.Occluded
+targetMark.FillColor = Color3.fromRGB(70, 220, 170)
+targetMark.OutlineColor = Color3.fromRGB(200, 255, 235)
+targetMark.FillTransparency = 0.85
+targetMark.OutlineTransparency = 0.1
+targetMark.Enabled = false
+targetMark.Parent = workspace
+
+local function restoreAimHit()
+	local scope = aimScope or gameG
+	if lastAimHit then
+		if scope.MouseHit == lastAimHit then scope.MouseHit = baseAimHit end
+		if scope.MouseHitMobile == lastAimHit then scope.MouseHitMobile = baseAimMobile end
+		if _G.pos_skill == lastAimHit then _G.pos_skill = baseAimLegacy end
+	end
+	lastAimHit = nil
+end
+
+local function publishAimHit(hit)
+	if not lastAimHit or gameG.MouseHit ~= lastAimHit then baseAimHit = gameG.MouseHit end
+	if not lastAimHit or gameG.MouseHitMobile ~= lastAimHit then baseAimMobile = gameG.MouseHitMobile end
+	if not lastAimHit or _G.pos_skill ~= lastAimHit then baseAimLegacy = _G.pos_skill end
+	gameG.MouseHit, gameG.MouseHitMobile, _G.pos_skill = hit, hit, hit
+	lastAimHit = hit
+end
+
+local function clearStraightAim()
+	if straightAim then straightStats.lastSkill = straightAim.remoteId end
+	straightAim = nil
+end
+
+local function straightSteeringHit()
+	local move = straightAim
+	if not move then return nil end
+	local now = os.clock()
+	local humanoid = move.character:FindFirstChildOfClass("Humanoid")
+	local velocity = move.velocity
+	if player.Character ~= move.character or not humanoid or humanoid.Health <= 0 or not move.root.Parent
+		or not velocity or velocity.Parent ~= move.root or now > move.deadline then clearStraightAim(); return nil end
+	local speed = velocity.Velocity.Magnitude
+	if speed > 35 then
+		if not move.flightStarted then move.flightStarted = now; move.deadline = now + move.duration + 0.25 end
+		local target, part = move.target, move.part
+		local targetHumanoid = target and target.Parent and target:FindFirstChildOfClass("Humanoid")
+		if targetHumanoid and targetHumanoid.Health > 0 and part and part.Parent and part:IsDescendantOf(target) then
+			move.heading = ComboPlanner.SteerDrag(move.launchHeading, move.heading, part.Position - move.root.Position, now - move.steerAt)
+		end
+		local dot = velocity.Velocity.Unit:Dot(move.launchHeading)
+		straightStats.samples = straightStats.samples + 1
+		straightStats.minForwardDot = math.min(straightStats.minForwardDot, dot)
+		straightStats.maxTurnDegrees = math.max(straightStats.maxTurnDegrees,
+			math.deg(math.acos(math.max(-1, math.min(1, move.heading:Dot(move.launchHeading))))))
+	elseif move.flightStarted and speed < 3 then
+		clearStraightAim()
+		return nil
+	end
+	move.steerAt = now
+	return CFrame.new(ComboPlanner.ForwardAnchor(move.root.Position, move.heading))
+end
+
+local function beginStraightAim(remoteId, hit)
+	local name = remoteId == "DF_RumbleRumble_C" and "RumbleRumble" or remoteId == "FS_Gale Fist_C" and "Gale Fist" or nil
+	local awake = false
+	if name == "RumbleRumble" then
+		local ok, value = pcall(gameG.CheckAwakeClient, player, "RumbleC")
+		awake = ok and value == true
+	end
+	if not name or not hit or not ComboPlanner.StraightMove(name, "C", awake) then return end
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local velocity = root and root:FindFirstChildOfClass("BodyVelocity")
+	if not velocity then return end
+	local delta = hit.Position - root.Position
+	local heading = delta.Magnitude > 0.01 and delta.Unit or root.CFrame.LookVector
+	straightAim = {remoteId = remoteId, character = character, root = root, velocity = velocity,
+		heading = heading, launchHeading = heading, target = aimTarget, part = aimPart, steerAt = os.clock(),
+		hit = hit, deadline = os.clock() + 5, duration = name == "RumbleRumble" and 1.5 or 0.9}
+	straightStats.casts, straightStats.samples, straightStats.minForwardDot = straightStats.casts + 1, 0, 1
+	straightStats.maxTurnDegrees = 0
+	local steering = straightSteeringHit()
+	if steering then publishAimHit(steering) end
+end
+
+local function livingPart(model)
+	if not model or not model:IsA("Model") or model == player.Character or not model:IsDescendantOf(workspace) then return nil end
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then return nil end
+	local part = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+	return part and part:IsA("BasePart") and part or nil
+end
+
+local function isNPC(model)
+	if Players:GetPlayerFromCharacter(model) then return false end
+	local ancestor = model
+	while ancestor and ancestor ~= workspace do
+		if ancestor.Name == "AllNPC" or ancestor.Name == "CharacterWorkshop" then return false end
+		ancestor = ancestor.Parent
+	end
+	return true
+end
+
+local function clearAimTarget()
+	aimTarget, aimPart, aimDistance = nil, nil, nil
+	targetMark.Enabled = false
+	targetMark.Adornee = nil
+	restoreAimHit()
+end
+
+
+local function resetCombo(reason, deferRelease)
+	comboState.epoch = comboState.epoch + 1
+	comboState.target, comboState.pending, comboState.sampled = nil, nil, nil
+	comboState.wasStunned, comboState.stunStart, comboState.stunDuration = false, nil, nil
+	comboState.phase = stopped and "즉시 중지" or reason or "대상 대기"
+	if activeCast and activeCast.combo then
+		local cast = activeCast
+		if deferRelease then task.defer(function() release(cast) end) else release(cast) end
+	end
+end
+
+local function refreshDuel()
+	if not alive then return duelState end
+	local previousLabel = duelState.label
+	local character = player.Character
+	local state
+	if (not character or character:GetAttribute("SpawnSuccess") ~= true) and duelState.active then
+		state = {active = true, name = duelState.name, ready = false, reason = "결투 상대 확인 대기"}
+	else
+		local friendly = character and character:GetAttribute("FriendlyPVP")
+		local name = character and character:GetAttribute("SoloDamage")
+		local other = type(name) == "string" and Players:FindFirstChild(name)
+		local model = other and other:IsA("Player") and other.Character
+		state = ComboPlanner.Duel(player.Name, friendly, name,
+			model and model:GetAttribute("FriendlyPVP"), model and model:GetAttribute("SoloDamage"))
+		state.target = state.ready and model or nil
+	end
+	local changedTarget = state.active ~= duelState.active or state.name ~= duelState.name
+		or state.ready ~= duelState.ready or state.target ~= duelState.target
+	if changedTarget then
+		state.epoch = duelState.epoch + 1
+		duelState = state
+		resetCombo(state.active and state.reason or "결투 종료 · 대상 복귀", true)
+		local cast = activeCast
+		if cast and not cast.combo then task.defer(function() release(cast) end) end
+		clearAimTarget()
+		aimScanAt = 0
+		paintAimMode()
+	else
+		state.epoch = duelState.epoch
+		duelState = state
+	end
+	if duelLabel then
+		local text = state.active and ((state.name and "결투 상대: @" .. state.name or "결투 상대 지정 대기")
+			.. (state.ready and " · 고정" or " · 확인 대기")) or "결투 없음 · 설정한 대상 탐색"
+		if text ~= previousLabel then duelLabel:SetText(text) end
+		state.label = text
+	end
+	return state
+end
+
+local function comboTargetValid(model, root)
+	local part = livingPart(model)
+	if not part or not root or (part.Position - root.Position).Magnitude > config.aimRange then return nil end
+	if duelState.active then return duelState.ready and model == duelState.target and part or nil end
+	local other = Players:GetPlayerFromCharacter(model)
+	if config.aimMode == "Player" and not other or config.aimMode == "NPC" and not isNPC(model) then return nil end
+	return part
+end
+
+local function sampleCombo(now)
+	if comboState.target and now > comboState.expires and not busy and not (activeCast and activeCast.combo) then comboState.target = nil end
+	local target = comboState.target or aimTarget
+	local part = livingPart(target)
+	if target ~= comboState.sampled then
+		comboState.sampled = target
+		comboState.wasStunned, comboState.stunStart, comboState.stunDuration = false, nil, nil
+	end
+	local stunned = part and target:FindFirstChild("Stun") ~= nil
+	if stunned and not comboState.wasStunned then comboState.stunStart = now end
+	if not stunned and comboState.wasStunned and comboState.stunStart then
+		local duration = now - comboState.stunStart
+		if duration > 0.04 then
+			comboState.stunDuration = comboState.stunDuration and math.min(comboState.stunDuration, duration) or duration
+		end
+		comboState.stunStart = nil
+	end
+	comboState.wasStunned = stunned == true
+	local observation = comboState.pending
+	if observation then
+		local humanoid = observation.target and observation.target:FindFirstChildOfClass("Humanoid")
+		if now > observation.expires or not humanoid or not observation.target:IsDescendantOf(workspace) then
+			comboState.pending = nil
+		else
+			local feedback = comboState.feedback[observation.id]
+			local cc = observation.target:FindFirstChild("Stun") ~= nil
+			if humanoid.Health < observation.health - 0.01 and not observation.hit then
+				observation.hit, feedback.hits = true, feedback.hits + 1
+			end
+			if cc and not observation.wasStunned and not observation.cc then
+				observation.cc, feedback.cc = true, feedback.cc + 1
+			end
+			observation.wasStunned = cc
+		end
+	end
+	if comboLabel and now >= comboState.lastLabel + 0.2 then
+		comboState.lastLabel = now
+		local name = comboState.target and comboState.target.Name or "대상 없음"
+		comboLabel:SetText(string.format("%s · %s · %d회 시전", name, comboState.phase, comboState.steps))
+		if presetLabel then
+			presetLabel:SetText(comboState.presetReason or (comboState.effectivePreset == "ThunderGale" and "뇌풍혈무 · 거리·적중·경직에 맞춰 연결"
+				or config.comboPreset == "ThunderGale" and "뇌풍혈무 선택 · 전용 장비 확인 대기" or "기본 / 범용 콤보 사용"))
+		end
+	end
+end
+
+local function observeComboAction(args)
+	local cast = activeCast
+	if not cast or args[1] ~= cast.remoteId or type(args[2]) ~= "table" then return end
+	local now, inputType = os.clock(), args[2].Type
+	cast.actionAt = now
+	if inputType == "Down" then
+		cast.downAt = now
+	elseif inputType == "Up" then
+		cast.upAt = now
+		if comboState.pending and comboState.pending.id == cast.skill.settingId then comboState.pending.expires = now + 0.9 end
+	else
+		cast.downAt, cast.instant = cast.downAt or now, true
+	end
+end
+
+local function comboProfile(skill)
+	local awake = false
+	if skill.name == "RumbleRumble" and type(gameG.CheckAwakeClient) == "function" then
+		local ok, value = pcall(gameG.CheckAwakeClient, player, "Rumble" .. skill.key)
+		awake = ok and value == true
+	end
+	local fn = skill.module[skill.key]
+	local cached = comboState.profiles and comboState.profiles[fn]
+	if not cached then
+		local hints = {}
+		if type(getconstants) == "function" then
+			local ok, values = pcall(getconstants, fn)
+			if ok and type(values) == "table" then
+				for _, value in pairs(values) do if type(value) == "string" then hints[#hints + 1] = value end end
+			end
+		end
+		cached = table.concat(hints, " ")
+		comboState.profiles = comboState.profiles or {}
+		comboState.profiles[fn] = cached
+	end
+	local cooldown = tonumber(skill.data[skill.key])
+	if skill.tool.Parent == player.Character and type(gameG.GetCooldownClient) == "function" then
+		local ok, value = pcall(gameG.GetCooldownClient, skill.id)
+		if ok and type(value) == "number" and value == value and value >= 0 and value < math.huge then cooldown = value end
+	end
+	local profile = ComboPlanner.Profile(skill.name, skill.key, awake, {cooldown = cooldown, hints = cached})
+	local rule = SkillRuntime.Rule(skill.name, skill.key)
+	if rule.toggle then profile.kind, profile.priority, profile.label = "setup", 180, "변신 준비" end
+	return profile
+end
+
+local function updatePresetState()
+	local special = config.comboPreset == "ThunderGale" and SkillRuntime.SpecialReady(candidates(true))
+		and statName("DFName") == "RumbleRumble" and statName("SwordName") == "Acrodagger" and statName("FightingStyle") == "Gale Fist"
+	local awake = true
+	if special then
+		for _, key in ipairs({"Z", "X", "C", "V", "E"}) do
+			local ok, value = pcall(gameG.CheckAwakeClient, player, "Rumble" .. key)
+			if not ok or value ~= true then awake = false end
+		end
+	end
+	comboState.effectivePreset = special and awake and "ThunderGale" or "Universal"
+	comboState.presetReason = config.comboPreset == "ThunderGale" and not (special and awake) and "전용 장비·럼블 각성 확인 대기 · 범용 콤보 사용" or nil
+	return {selected = config.comboPreset, effective = comboState.effectivePreset, equipmentReady = special == true, awakened = awake, reason = comboState.presetReason}
+end
+
+local function chooseCombo(list)
+	updatePresetState()
+	if not config.aimEnabled and not duelState.active then return nil, "사일런트 에임을 켜주세요" end
+	local target, part = aimTarget, livingPart(aimTarget)
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not part or not root then return nil, "조준 대상 대기" end
+	local now = os.clock()
+	if comboState.target ~= target then comboState.target, comboState.expires = target, now + 0.25 end
+	sampleCombo(now)
+	comboState.target = target
+	local humanoid = target:FindFirstChildOfClass("Humanoid")
+	local remaining = 0
+	if comboState.wasStunned then
+		remaining = comboState.stunDuration and math.max(0, comboState.stunDuration - (now - (comboState.stunStart or now))) or 0.22
+	end
+	for _, skill in ipairs(list) do skill.profile = comboProfile(skill) end
+	local context = {
+		valid = humanoid and humanoid.Health > 0, distance = (part.Position - root.Position).Magnitude,
+		maxDistance = config.comboDistance, aimRange = config.aimRange, allowDash = config.comboDash, stunned = comboState.wasStunned,
+		remaining = remaining, healthRatio = humanoid and humanoid.Health / math.max(1, humanoid.MaxHealth) or 1,
+		now = now, lastSkill = comboState.lastSkill, lastUse = comboState.lastUse, feedback = comboState.feedback,
+	}
+	local delta, velocity = part.Position - root.Position, part.AssemblyLinearVelocity
+	context.knockback = delta.Magnitude > 0.01 and velocity.Magnitude < 1000 and velocity:Dot(delta.Unit) or 0
+	context.airborne = humanoid.FloorMaterial == Enum.Material.Air or math.abs(delta.Y) > 12
+	context.enemyDoing = target:FindFirstChild("TotalDoing") ~= nil
+	local pending = comboState.pending
+	context.recentHit = pending and pending.target == target and now < pending.expires and (pending.hit or pending.cc) or false
+	local chooser = comboState.effectivePreset == "ThunderGale" and ComboPlanner.ChooseStorm or ComboPlanner.Choose
+	local skill, decision, diagnostics = chooser(list, context)
+	comboState.selection = diagnostics
+	return skill, decision
+end
+
+local function selectAimTarget()
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not root or not humanoid or humanoid.Health <= 0 then return nil end
+	if duelState.active then
+		local model = duelState.ready and duelState.target
+		local part = model and comboTargetValid(model, root)
+		if part then return model, part, (part.Position - root.Position).Magnitude end
+		return nil
+	end
+	if config.comboEnabled and comboState.target and (busy or os.clock() < comboState.expires) then
+		local pinned = comboTargetValid(comboState.target, root)
+		if pinned then return comboState.target, pinned, (pinned.Position - root.Position).Magnitude end
+	end
+	local closest, part, distance = nil, nil, config.aimRange * config.aimRange
+	local function consider(model)
+		local candidate = livingPart(model)
+		if not candidate then return end
+		local delta = candidate.Position - root.Position
+		local squared = delta:Dot(delta)
+		if squared < distance then closest, part, distance = model, candidate, squared end
+	end
+	if config.aimMode == "Player" then
+		for _, other in ipairs(Players:GetPlayers()) do if other ~= player then consider(other.Character) end end
+	else
+		for humanoid in pairs(npcHumanoids) do
+			local model = humanoid.Parent
+			if not model or not humanoid:IsDescendantOf(workspace) then npcHumanoids[humanoid] = nil
+			elseif humanoid.Health > 0 and model:IsA("Model") and isNPC(model) then consider(model) end
+		end
+	end
+	return closest, part, closest and math.sqrt(distance) or nil
+end
+
+local function aimHit(forRemote)
+	refreshDuel()
+	if not alive or stopped or not (config.aimEnabled or duelState.active) or not aimCell or aimCell.Owner ~= api then return nil end
+	if not forRemote then
+		local steering = straightSteeringHit()
+		if steering then return steering end
+	end
+	local part = livingPart(aimTarget)
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not part or part ~= aimPart or not root or not humanoid or humanoid.Health <= 0 then return nil end
+	local targetPlayer = Players:GetPlayerFromCharacter(aimTarget)
+	if duelState.active then
+		if not duelState.ready or aimTarget ~= duelState.target then return nil end
+	elseif config.aimMode == "Player" and not targetPlayer or config.aimMode == "NPC" and not isNPC(aimTarget) then return nil end
+	if (part.Position - root.Position).Magnitude > config.aimRange then return nil end
+	local position, velocity = part.Position, part.AssemblyLinearVelocity
+	if velocity.Magnitude == velocity.Magnitude and velocity.Magnitude < 1000 then position = position + velocity * 0.12 end
+	return CFrame.new(position)
+end
+
+local function rewriteAim(args, preview)
+	refreshSkillState()
+	if not preview and straightAim and args[1] ~= straightAim.remoteId then clearStraightAim() end
+	local hit = aimHit(true)
+	local cast = activeCast
+	if cast and args[1] == cast.remoteId and type(args[2]) == "table" and args[2].Type ~= "Up"
+		and (cast.skillRevision ~= skillState.revision or cast.strategyEpoch ~= strategyEpoch) then
+		if not preview then cast.blocked = "스킬 구성 변경 · 공격 대기" end
+		return nil, true
+	end
+	if cast and args[1] == cast.remoteId and ComboPlanner.DuelCastBlocked(cast.duelEpoch, duelState.epoch, cast.duelProtected, duelState.active, hit ~= nil) then
+		if not preview then cast.blocked = "결투 대상 변경 · 공격 대기" end
+		return nil, true
+	end
+	if not preview then observeComboAction(args) end
+	if not hit then return nil end
+	local name, payload = args[1], args[2]
+	if type(name) ~= "string" or type(payload) ~= "table" or name:sub(3, 3) ~= "_" then return nil end
+	local family = name:sub(1, 2)
+	if family ~= "DF" and family ~= "SW" and family ~= "FS" then return nil end
+	local value = payload.MouseHit
+	if typeof(value) ~= "CFrame" and typeof(value) ~= "Vector3" then return nil end
+	local copied = {}
+	for key, item in pairs(payload) do copied[key] = item end
+	copied.MouseHit = typeof(value) == "Vector3" and hit.Position or hit
+	if not preview and payload.Type == "Up" then beginStraightAim(name, hit) end
+	args[2] = copied
+	if not preview then aimRewrites = aimRewrites + 1 end
+	return args
+end
+
+local function installAim()
+	if aimCell and aimCell.Owner == api and aimScope == gameG then return true end
+	if not aimSupported then return false, "이 실행기에서 SkillAction 조준 보정을 지원하지 않습니다" end
+	if aimScope and aimScope ~= gameG then
+		restoreAimHit()
+		if mouseWrapper and aimScope.GetMouse == mouseWrapper then aimScope.GetMouse = originalMouse end
+		if mobileWrapper and aimScope.MouseHitMobileUpdate == mobileWrapper then aimScope.MouseHitMobileUpdate = originalMobile end
+		mouseWrapper, mobileWrapper = nil, nil
+	end
+	local hookKey = "KL_BOUNTY_SILENT_AIM_ONLY_V2_HOOK_CELL"
+	aimCell = env[hookKey]
+	if type(aimCell) ~= "table" or aimCell.Version ~= 2 then
+		aimCell = {Version = 2}
+		local relay = aimCell
+		local predecessor
+		predecessor = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+			local callback = relay.Handler
+			local method = callback and self == relay.Remote and getnamecallmethod()
+			if method == "InvokeServer" then
+				local ok, changed, blocked = pcall(callback, table.pack(...))
+				setnamecallmethod(method)
+				if ok and blocked then return nil end
+				if ok and changed then return predecessor(self, table.unpack(changed, 1, changed.n)) end
+			end
+			return predecessor(self, ...)
+		end))
+		env[hookKey] = aimCell
+	end
+	if aimCell.Owner ~= api then previousAimCell = {Owner = aimCell.Owner, Remote = aimCell.Remote, Handler = aimCell.Handler} end
+	aimCell.Owner, aimCell.Remote, aimCell.Handler = api, skillRemote, rewriteAim
+	aimScope = gameG
+	local legacy = env.KL_BOUNTY_SILENT_AIM_ONLY_V1_HOOK_CELL
+	if type(legacy) == "table" and legacy.Handler then
+		legacyAimCell = {cell = legacy, Owner = legacy.Owner, Remote = legacy.Remote, Handler = legacy.Handler}
+		legacy.Owner, legacy.Handler = api, nil
+	end
+	if type(gameG.GetMouse) == "function" then
+		originalMouse = gameG.GetMouse
+		local fallback = originalMouse
+		mouseWrapper = function(...)
+			local hit = aimHit()
+			if hit then return hit end
+			return fallback(...)
+		end
+		gameG.GetMouse = mouseWrapper
+	end
+	if type(gameG.MouseHitMobileUpdate) == "function" then
+		originalMobile = gameG.MouseHitMobileUpdate
+		local fallback = originalMobile
+		mobileWrapper = function(...)
+			if lastAimHit and gameG.MouseHitMobile == lastAimHit then gameG.MouseHitMobile = baseAimMobile end
+			local values = table.pack(fallback(...))
+			local hit = aimHit()
+			if hit then publishAimHit(hit) else restoreAimHit() end
+			return table.unpack(values, 1, values.n)
+		end
+		gameG.MouseHitMobileUpdate = mobileWrapper
+	end
+	return true
+end
+
+local function detachAim()
+	if aimCell and aimCell.Owner == api then
+		local previous = previousAimCell or {}
+		aimCell.Owner, aimCell.Remote, aimCell.Handler = previous.Owner, previous.Remote, previous.Handler
+	end
+	if legacyAimCell and legacyAimCell.cell.Owner == api then
+		local previous, cell = legacyAimCell, legacyAimCell.cell
+		cell.Owner, cell.Remote, cell.Handler = previous.Owner, previous.Remote, previous.Handler
+	end
+	local scope = aimScope or gameG
+	if mouseWrapper and scope.GetMouse == mouseWrapper then scope.GetMouse = originalMouse end
+	if mobileWrapper and scope.MouseHitMobileUpdate == mobileWrapper then scope.MouseHitMobileUpdate = originalMobile end
+	clearAimTarget()
+	targetMark:Destroy()
+end
+
+local function updateAim(now)
+	refreshSkillState()
+	if skillState.unavailable then clearAimTarget(); return end
+	refreshDuel()
+	if stopped or not (config.aimEnabled or duelState.active) then return end
+	if aimScope ~= gameG or duelState.active and (not aimCell or aimCell.Owner ~= api) then
+		local ok, installed, reason = pcall(installAim)
+		if not ok or not installed then aimError = tostring(ok and reason or installed); clearAimTarget(); return end
+	end
+	if now >= aimScanAt then
+		aimScanAt = now + 0.15
+		aimTarget, aimPart, aimDistance = selectAimTarget()
+		if targetLabel then
+			local other = aimTarget and Players:GetPlayerFromCharacter(aimTarget)
+			local name = other and ("@" .. other.Name) or aimTarget and aimTarget.Name
+			targetLabel:SetText(name and string.format("현재 대상: %s · %.0f스터드", name, aimDistance) or "현재 대상 없음")
+		end
+	end
+	local hit = aimHit()
+	if hit then
+		publishAimHit(hit)
+		targetMark.Adornee, targetMark.Enabled = aimTarget, true
+	else
+		clearAimTarget()
+	end
+end
+
+local function saveMessage(message)
+	if saveLabel and window and window.Alive then saveLabel:SetText(message) end
+end
+
+local function saveNow()
+	if not dirty then return saveError == nil end
+	env[settingsKey] = config
+	if type(writefile) ~= "function" or type(readfile) ~= "function" then
+		saveError = "설정 파일 읽기·쓰기를 지원하지 않습니다"
+		saveMessage("이번 실행에서만 유지 · " .. saveError)
+		return false
+	end
+	local ok, reason = pcall(function()
+		local encoded = HttpService:JSONEncode(config)
+		writefile(settingsFile, encoded)
+		assert(readfile(settingsFile) == encoded, "저장한 설정의 내용이 일치하지 않습니다")
+	end)
+	if not ok then
+		saveError = tostring(reason)
+		saveMessage("저장 실패 · " .. saveError)
+		warn("스킬 버튼 설정 저장 실패: " .. saveError)
+		return false
+	end
+	dirty, saveError = false, nil
+	saveMessage("설정 저장됨")
+	return true
+end
+
+local function changed()
+	dirty = true
+	env[settingsKey] = config
+	saveSerial = saveSerial + 1
+	local serial = saveSerial
+	saveMessage("설정 저장 대기")
+	task.delay(0.35, function()
+		if alive and serial == saveSerial then saveNow() end
+	end)
+end
+
+
+function api:SetAim(enabled, mode, range)
+	if not alive then return false end
+	resetCombo("대상 변경")
+	if enabled then
+		local ok, installed, reason = pcall(installAim)
+		if not ok or not installed then
+			aimError = tostring(ok and reason or installed)
+			config.aimEnabled = false
+			clearAimTarget()
+			if aimControl then aimControl:Set(false, true) end
+			if targetLabel then targetLabel:SetText("조준 보정 오류 · " .. aimError) end
+			return false, aimError
+		end
+	end
+	config.aimEnabled = enabled == true
+	if not config.aimEnabled and not duelState.active then clearStraightAim() end
+	if mode == "Player" or mode == "NPC" then config.aimMode = mode end
+	local number = tonumber(range)
+	if number and number == number and math.abs(number) < math.huge then config.aimRange = math.clamp(number, 50, 3000) end
+	aimError, aimScanAt = nil, 0
+	clearAimTarget()
+	if aimControl then aimControl:Set(config.aimEnabled, true) end
+	if aimModeControl then aimModeControl:Set(config.aimMode, true) end
+	if aimRangeControl then aimRangeControl:Set(config.aimRange, true) end
+	if targetLabel then targetLabel:SetText(stopped and "즉시 중지 · 중지 해제 후 다시 사용" or config.aimEnabled and "현재 대상 확인 중" or "사일런트 에임 꺼짐") end
+	paintAimMode()
+	if config.aimEnabled then updateAim(os.clock()) end
+	changed()
+	return true
+end
+
+function api:ToggleAimMode()
+	local mode = config.aimMode == "Player" and "NPC" or "Player"
+	return self:SetAim(config.aimEnabled, mode)
+end
+
+function api:SetCombo(enabled, distance, allowDash)
+	if not alive then return false end
+	config.comboEnabled = enabled == true
+	local number = tonumber(distance)
+	if number and number == number and math.abs(number) < math.huge then config.comboDistance = math.clamp(number, 25, 300) end
+	if type(allowDash) == "boolean" then config.comboDash = allowDash end
+	resetCombo(config.comboEnabled and "연계 대기" or "무작위 사용")
+	title.Text = config.comboEnabled and "연계" or "스킬"
+	if not busy and not stopped then caption.Text = config.comboEnabled and "콤보" or "무작위" end
+	if comboControl then comboControl:Set(config.comboEnabled, true) end
+	if comboDistanceControl then comboDistanceControl:Set(config.comboDistance, true) end
+	if comboDashControl then comboDashControl:Set(config.comboDash, true) end
+	if config.comboEnabled and not config.aimEnabled then self:SetAim(true) end
+	changed()
+	return true
+end
+
+function api:SetPreset(value)
+	if not alive then return false end
+	value = SkillRuntime.Preset(value)
+	if config.comboPreset ~= value then
+		config.comboPreset, strategyEpoch = value, strategyEpoch + 1
+		resetCombo("프리셋 변경", true)
+		comboState.feedback, comboState.lastUse, comboState.selection = {}, {}, nil
+		comboState.effectivePreset, comboState.presetReason = nil, nil
+		nextAuto = 0
+		changed()
+	end
+	if presetControl then presetControl:Set(value, true) end
+	if presetLabel then presetLabel:SetText(value == "ThunderGale" and "뇌풍혈무 선택 · 전용 장비 확인 후 연계" or "기본 / 범용 콤보 선택") end
+	return true
+end
+
+function api:GetPresetStatus() return updatePresetState() end
+
+function api:GetComboStatus()
+	updatePresetState()
+	local feedback = {}
+	for id, value in pairs(comboState.feedback) do feedback[id] = {attempts = value.attempts, hits = value.hits, cc = value.cc} end
+	return {enabled = config.comboEnabled, phase = comboState.phase, target = comboState.target and comboState.target.Name,
+		preset = config.comboPreset, effectivePreset = comboState.effectivePreset, presetReason = comboState.presetReason,
+		steps = comboState.steps, distance = config.comboDistance, allowDash = config.comboDash,
+		stunned = comboState.wasStunned, observedStunDuration = comboState.stunDuration, feedback = feedback, history = comboState.history}
+end
+
+function api:PreviewCombo()
+	local skill, decision = chooseCombo(candidates())
+	return skill and {id = skill.settingId, hold = decision.hold, recovery = decision.recovery, role = decision.role} or {waiting = decision}
+end
+
+function api:GetAimStatus()
+	return {
+		enabled = config.aimEnabled, paused = stopped, mode = config.aimMode, range = config.aimRange,
+		effectiveMode = duelState.active and "Duel" or config.aimMode,
+		duel = {active = duelState.active, ready = duelState.ready, opponent = duelState.name, epoch = duelState.epoch},
+		target = aimTarget and aimTarget.Name, path = aimTarget and aimTarget:GetFullName(),
+		distance = aimDistance, isPlayer = aimTarget and Players:GetPlayerFromCharacter(aimTarget) ~= nil,
+		hookOwned = aimCell and aimCell.Owner == self or false, rewrites = aimRewrites, error = aimError,
+		straightMove = {active = straightAim ~= nil, skill = straightAim and straightAim.remoteId or straightStats.lastSkill,
+			casts = straightStats.casts, samples = straightStats.samples, minForwardDot = straightStats.minForwardDot,
+			maxTurnDegrees = straightStats.maxTurnDegrees or 0},
+	}
+end
+
+local function applyPosition()
+	local x, y = config.x / 100, config.y / 100
+	button.Position = UDim2.new(x, (0.5 - x) * 72, y, (0.5 - y) * 72)
+	layoutAutoButton()
+end
+
+function api:SetPosition(x, y)
+	if not alive then return false end
+	config.x, config.y = percent(x, config.x), percent(y, config.y)
+	applyPosition()
+	if xControl then xControl:Set(config.x, true) end
+	if yControl then yControl:Set(config.y, true) end
+	changed()
+	return true
+end
+
+local function selection()
+	local values = {}
+	for id in pairs(config.excluded) do values[#values + 1] = id end
+	table.sort(values)
+	return values
+end
+
+function api:SetExcluded(values)
+	if not alive or type(values) ~= "table" then return false end
+	local excluded = {}
+	for _, id in ipairs(values) do
+		if type(id) == "string" and id:match("^.+::[A-Z]$") then excluded[id] = true end
+	end
+	config.excluded = excluded
+	if excludedControl then excludedControl:Set(selection(), true) end
+	changed()
+	return true
+end
+
+function api:GetSettings()
+	return {x = config.x, y = config.y, excluded = selection(), aimEnabled = config.aimEnabled, aimMode = config.aimMode, aimRange = config.aimRange, comboEnabled = config.comboEnabled, comboDistance = config.comboDistance, comboDash = config.comboDash, comboPreset = config.comboPreset, file = settingsFile, saveError = saveError}
+end
+
+function api:GetSkillDiagnostics()
+	local list = {}
+	local _, casterReason = characterReady()
+	for _, skill in ipairs(candidates(true)) do
+		local available, reason = allowed(skill)
+		local strategy = comboState.selection and comboState.selection.skills[skill.settingId]
+		local profile = comboProfile(skill)
+		list[#list + 1] = {
+			id = skill.settingId, name = skill.tool.Name .. " · " .. skill.key, available = available,
+			reason = available and (stopped and "즉시 중지 상태" or casterReason or "사용 가능") or reason,
+			priority = strategy and strategy.reason or nil,
+			selected = comboState.selection and comboState.selection.selected == skill.settingId or false,
+			profile = {kind = profile.kind, role = profile.label, source = profile.source, cooldown = profile.cooldown},
+		}
+	end
+	table.sort(list, function(a, b) return a.id < b.id end)
+	return list
+end
+
+function api:GetSkills(availableOnly)
+	local list = {}
+	for _, skill in ipairs(candidates(not availableOnly)) do
+		list[#list + 1] = {id = skill.settingId, name = skill.tool.Name .. " · " .. skill.key, excluded = config.excluded[skill.settingId] == true}
+	end
+	table.sort(list, function(a, b) return a.id < b.id end)
+	return list
+end
+
+local function refreshOptions()
+	if not alive or not excludedControl then return end
+	local choices, seen = {}, {}
+	for _, skill in ipairs(api:GetSkills(false)) do
+		choices[#choices + 1] = {Value = skill.id, Label = skill.name}
+		seen[skill.id] = true
+	end
+	for _, id in ipairs(selection()) do
+		if not seen[id] then choices[#choices + 1] = {Value = id, Label = id:gsub("::", " · ") .. " (미소지)"} end
+	end
+	table.sort(choices, function(a, b) return a.Value < b.Value end)
+	excludedControl:SetOptions(choices, true)
+	excludedControl:Set(selection(), true)
+end
+
+skillStateChanged = function()
+	resetCombo("스킬 구성 갱신", true)
+	comboState.profiles, comboState.feedback, comboState.lastUse, comboState.selection = {}, {}, {}, nil
+	comboState.effectivePreset, comboState.presetReason = nil, nil
+	if formLabel then formLabel:SetText(#skillState.forms > 0 and ("변신 감지: " .. table.concat(skillState.forms, ", ")) or "기본 모습 · 소지 장비 자동 인식") end
+	local revision = skillState.revision
+	task.defer(function() if alive and revision == skillState.revision then refreshOptions() end end)
+end
+
+
+
+function api:StopNow()
+	if not alive then return false end
+	clearStraightAim()
+	stopped, stopEpoch = true, stopEpoch + 1
+	autoEnabled, autoEpoch = false, autoEpoch + 1
+	nextAuto = math.huge
+	if autoControl then autoControl:Set(false, true) end
+	autoButton.Text = "자동 꺼짐"
+	autoButton.TextColor3 = Color3.fromRGB(225, 223, 211)
+	autoStroke.Color = Color3.fromRGB(125, 128, 122)
+	local cast = activeCast
+	resetCombo("즉시 중지", true)
+	if cast and not cast.combo then task.defer(function() release(cast) end) end
+	clearAimTarget()
+	if targetLabel then targetLabel:SetText("즉시 중지 · 중지 해제 후 다시 사용") end
+	if comboLabel then comboLabel:SetText("즉시 중지 · 새 시전 대기 요청 취소됨") end
+	paintStop()
+	show("중지됨")
+	return true
+end
+
+function api:Resume()
+	if not alive then return false end
+	stopped = false
+	paintStop()
+	show("스킬 사용")
+	comboState.phase = "연계 대기"
+	aimScanAt = 0
+	if config.aimEnabled then updateAim(os.clock()) end
+	return true
+end
+
+function api:SetAuto(enabled)
+	if not alive then return false end
+	enabled = enabled == true
+	if enabled and stopped then self:Resume() end
+	if autoEnabled == enabled then return true end
+	autoEnabled = enabled
+	autoEpoch = autoEpoch + 1
+	nextAuto = 0
+	if autoControl then autoControl:Set(enabled, true) end
+	autoButton.Text = enabled and "자동 켜짐" or "자동 꺼짐"
+	autoButton.TextColor3 = enabled and Color3.fromRGB(150, 255, 175) or Color3.fromRGB(225, 223, 211)
+	autoStroke.Color = enabled and Color3.fromRGB(100, 225, 135) or Color3.fromRGB(125, 128, 122)
+	if not enabled then resetCombo("자동 사용 중단") end
+	if not enabled and activeCast and activeCast.automatic then
+		local cast = activeCast
+		task.defer(function() release(cast) end)
+	end
+	return true
+end
+
+function api:ToggleAuto()
+	return self:SetAuto(not autoEnabled)
+end
+
+function api:UseRandom(autoToken)
+	refreshSkillState()
+	local skillRevision, capturedStrategy = skillState.revision, strategyEpoch
+	refreshDuel()
+	local duelEpoch = duelState.epoch
+	local requestEpoch = stopEpoch
+	local function canceled()
+		refreshSkillState()
+		refreshDuel()
+		return skillRevision ~= skillState.revision or capturedStrategy ~= strategyEpoch or duelEpoch ~= duelState.epoch
+			or ComboPlanner.IsCanceled(alive, stopped, requestEpoch, stopEpoch, autoToken, autoEnabled, autoEpoch)
+	end
+	if canceled() then return false, stopped and "즉시 중지 상태" or "자동 사용 중단" end
+	if not alive or busy then return false, "시전 중" end
+	updateAim(os.clock())
+	if duelState.active and not aimHit() then
+		local reason = duelState.ready and "결투 상대 거리·조준 확인 대기" or "결투 상대 확인 대기"
+		show(reason, 0.4)
+		return false, reason
+	end
+	local humanoid, reason = characterReady()
+	if not humanoid then show(reason, 0.7) return false, reason end
+	local list = candidates()
+	if #list == 0 then show("사용 가능 없음", 0.9) return false, "사용 가능 없음" end
+	if canceled() then return false, "자동 사용 중단" end
+	if busy then return false, "시전 중" end
+	local useCombo = config.comboEnabled
+	local skill, decision
+	if useCombo then
+		skill, decision = chooseCombo(list)
+		if not skill then comboState.phase = decision; show(decision, 0.4); return false, decision end
+	else
+		skill = list[random:NextInteger(1, #list)]
+	end
+	local comboEpoch = comboState.epoch
+	local attempted = false
+	local blockedReason
+	busy = true
+	show("장비 준비")
+	local ok, err = pcall(function()
+		if canceled() then blockedReason = "자동 사용 중단"; return end
+		if skill.tool.Parent ~= player.Character then
+			humanoid:EquipTool(skill.tool)
+			task.wait(0.05)
+		end
+		if canceled() or useCombo and comboEpoch ~= comboState.epoch then blockedReason = "연계 중단"; return end
+		local current, blocked = characterReady()
+		if current ~= humanoid or not allowed(skill) or skill.tool.Parent ~= player.Character then
+			blockedReason = blocked or "다시 눌러주세요"
+			show(blockedReason, 0.8)
+			return
+		end
+		if canceled() or useCombo and comboEpoch ~= comboState.epoch then blockedReason = "연계 중단"; return end
+		if duelState.active and not aimHit() then blockedReason = "결투 상대 확인 대기"; return end
+		if useCombo then
+			local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+			local pinned = comboTargetValid(comboState.target, root)
+			if not pinned or (pinned.Position - root.Position).Magnitude > config.aimRange then blockedReason = "조준 대상 거리 변경"; return end
+		end
+		lastSkill = skill.tool.Name .. " " .. skill.key
+		show(lastSkill)
+		local cast = {
+			skill = skill, released = false, automatic = autoToken ~= nil, combo = useCombo,
+			duelEpoch = duelEpoch, duelProtected = duelState.active,
+			skillRevision = skillRevision, strategyEpoch = capturedStrategy,
+			character = player.Character, doingTokens = {},
+			expectUp = SkillRuntime.ExpectsUp(skill.name, skill.key),
+			remoteId = skill.family.prefix .. "_" .. skill.name .. "_" .. skill.key, started = os.clock(),
+		}
+		activeCast = cast
+		ensureDoingTracker()
+		if useCombo then
+			comboState.phase, comboState.lastSkill = decision.role, skill.settingId
+			comboState.lastUse[skill.settingId] = cast.started
+			comboState.expires = cast.started + decision.hold + decision.channel + 3.5
+			local feedback = comboState.feedback[skill.settingId] or {attempts = 0, hits = 0, cc = 0}
+			comboState.feedback[skill.settingId] = feedback
+			feedback.attempts = feedback.attempts + 1
+			local humanoid = comboState.target:FindFirstChildOfClass("Humanoid")
+			comboState.pending = {id = skill.settingId, target = comboState.target, health = humanoid.Health,
+				wasStunned = comboState.target:FindFirstChild("Stun") ~= nil, expires = cast.started + decision.hold + decision.channel + 2}
+		end
+		local hold = useCombo and decision.hold or 0.04
+		if useCombo then
+			task.spawn(function()
+				while alive and not cast.released and not canceled() and comboEpoch == comboState.epoch do
+					local now = os.clock()
+					if ComboPlanner.HoldReady(cast, hold, now) then break end
+					task.wait()
+				end
+				if not cast.released then cast.releasedAt = os.clock(); release(cast) end
+			end)
+		else
+			task.delay(hold, function() release(cast) end)
+		end
+		task.delay(10, function()
+			if alive and busy and activeCast == cast then show("응답 대기 중") end
+		end)
+		attempted = true
+		if autoToken ~= nil then autoCastCount = autoCastCount + 1 end
+		local done, callOK, callError = false, false, nil
+		cast.thread = task.spawn(function()
+			cast.nativeThread = coroutine.running()
+			callOK, callError = pcall(skill.fn)
+			done = true
+		end)
+		while not done and alive and os.clock() < cast.started + 25 do
+			if canceled() then release(cast); cast.interrupted = true end
+			task.wait()
+		end
+		if not done then
+			release(cast)
+			pcall(task.cancel, cast.thread)
+			cleanupOwnDoing(cast)
+			cast.blocked = "스킬 전환·응답 확인 대기"
+			skillState.retry[skill.settingId] = os.clock() + 0.5
+		elseif not callOK then
+			cleanupOwnDoing(cast)
+			skillState.retry[skill.settingId] = os.clock() + 1
+			error(callError)
+		end
+		cast.callReturned = done
+		if cast.interrupted or canceled() then cast.blocked = "스킬 구성·프리셋 전환 완료 대기" end
+		if done and not cast.actionAt and aimCell and aimCell.Owner == api then
+			cast.blocked = "게임 스킬 사용 조건 확인 대기"
+			skillState.retry[skill.settingId] = os.clock() + 0.5
+		end
+		if cast.blocked then attempted = false; blockedReason = cast.blocked end
+		if useCombo then
+			local deadline = cast.started + math.max(decision.hold + decision.channel + 2, cast.expectUp and 8 or 0)
+			while alive and not cast.blocked and not canceled() and comboEpoch == comboState.epoch and os.clock() < deadline do
+				local charging = player.Character and player.Character:FindFirstChild("ChargeFolder") ~= nil
+				if ComboPlanner.CanAdvance(cast, decision, os.clock(), gameG.CheckDoingClient(player), charging) then break end
+				task.wait()
+			end
+			release(cast)
+			if (cast.upAt or cast.downAt and cast.callReturned) and not cast.blocked and skillRevision == skillState.revision then
+				comboState.steps = comboState.steps + 1
+				comboState.history[#comboState.history + 1] = {
+					id = skill.settingId, role = decision.role, requestedHold = decision.hold,
+					observedHold = cast.downAt and cast.releasedAt and cast.releasedAt - cast.downAt or nil,
+					upObserved = cast.upAt ~= nil,
+				}
+				if #comboState.history > 8 then table.remove(comboState.history, 1) end
+			end
+		else
+			release(cast)
+		end
+		if activeCast == cast then activeCast = nil end
+	end)
+	busy = false
+	if not alive then return ok, err end
+	if not ok then
+		release(activeCast)
+		activeCast = nil
+		warn("스킬 사용 오류: " .. tostring(err))
+		show("스킬 오류", 1)
+		return false, tostring(err)
+	end
+	show(displayed, 0.8)
+	return attempted, attempted and lastSkill or blockedReason
+end
+
+function api:GetRuntimeStatus()
+	refreshSkillState()
+	return {revision = skillState.revision, rebuilds = skillState.rebuilds, forms = skillState.forms,
+		unavailable = skillState.unavailable, error = skillState.error, connections = #connections,
+		characterConnections = #characterConnections, autoLoops = alive and 1 or 0, strategyEpoch = strategyEpoch}
+end
+
+function api:GetStatus()
+	return {alive = alive, stopped = stopped, busy = busy, lastSkill = lastSkill, autoEnabled = autoEnabled, autoQueued = autoQueued, autoCastCount = autoCastCount, aim = self:GetAimStatus(), combo = self:GetComboStatus(), runtime = self:GetRuntimeStatus(), fixed = true, layoutMode = "설정한 위치에 고정", settings = self:GetSettings(), position = {x = button.AbsolutePosition.X, y = button.AbsolutePosition.Y}, size = button.AbsoluteSize.X}
+end
+
+function api:Destroy()
+	if not alive then return end
+	clearStraightAim()
+	if dirty then saveNow() end
+	autoEnabled, autoEpoch = false, autoEpoch + 1
+	stopped, stopEpoch = true, stopEpoch + 1
+	alive = false
+	detachAim()
+	release(activeCast)
+	if activeCast and activeCast.thread then pcall(task.cancel, activeCast.thread); cleanupOwnDoing(activeCast) end
+	detachDoingTracker()
+	for _,connection in ipairs(connections) do connection:Disconnect() end
+	for _,connection in ipairs(characterConnections) do connection:Disconnect() end
+	if window and window.Alive then window:Destroy() end
+	gui:Destroy()
+	if env[key] == api then env[key] = nil end
+end
+window = UI:CreateWindow({
+	Id = "random-skill-settings", Title = "스킬 버튼 설정",
+	Subtitle = "스킬 콤보·사일런트 에임·버튼 위치", Theme = "CodexDark", Locale = "ko",
+	Width = 480, Height = 460, Search = false, ThemeToggle = false,
+	ToggleKey = false, CloseBehavior = "Minimize", DisplayOrder = 130,
+})
+api.Window = window
+window:OnDestroy(function() api:Destroy() end)
+local tab = window:Tab({Id = "settings", Title = "설정"})
+local autoSection = tab:Section({Title = "자동 스킬 사용", Description = "자동 버튼으로 전환하고 빨간 즉시 중지 버튼으로 대기 중인 시전까지 끕니다. 중지 해제만으로 자동 사용이 켜지지는 않습니다."})
+autoControl = autoSection:Toggle({
+	Id = "auto-skills", Text = "자동 스킬 사용", Default = false, Persist = false,
+	Callback = function(enabled) api:SetAuto(enabled) end,
+})
+
+
+autoSection:Button({Id = "stop-now", Text = "모든 스킬 사용 즉시 중지", ActionText = "즉시 중지", Style = "Danger", Callback = function() api:StopNow() end})
+autoSection:Button({Id = "resume-skills", Text = "중지 상태 해제", ActionText = "중지 해제", Callback = function() api:Resume() end})
+
+local comboSection = tab:Section({Title = "스킬 콤보", Description = "장비를 바꾸면 소지 스킬을 다시 인식합니다. 기술별 설정이 없으면 게임 데이터·기능 단서·실제 동작 종료를 사용합니다. 기술 분류는 추정이며 서버 판정 사거리는 아닙니다."})
+presetControl = comboSection:Dropdown({
+	Id = "combo-preset", Text = "콤보 프리셋", Searchable = false, Persist = false,
+	Options = {{Value = "Universal", Label = "기본 / 범용 콤보"}, {Value = "ThunderGale", Label = "뇌풍혈무 / Rumble + Acrodagger + Gale Fist"}},
+	Default = config.comboPreset, Callback = function(value) api:SetPreset(value) end,
+})
+presetLabel = comboSection:Label({Id = "preset-status", Text = config.comboPreset == "ThunderGale" and "뇌풍혈무 선택 · 장비 확인 대기" or "기본 / 범용 콤보 사용"})
+formLabel = comboSection:Label({Id = "form-status", Text = #skillState.forms > 0 and "변신 감지: " .. table.concat(skillState.forms, ", ") or "기본 모습 · 소지 장비 자동 인식"})
+comboControl = comboSection:Toggle({
+	Id = "combo-skills", Text = "무작위 대신 콤보 사용", Default = config.comboEnabled, Persist = false,
+	Callback = function(value) api:SetCombo(value) end,
+})
+comboDistanceControl = comboSection:Slider({
+	Id = "combo-distance", Text = "콤보 우선 거리", Min = 25, Max = 300, Step = 5,
+	Suffix = "스터드", Default = config.comboDistance, Persist = false,
+	Callback = function(value) api:SetCombo(config.comboEnabled, value) end,
+})
+comboDashControl = comboSection:Toggle({
+	Id = "combo-dash", Text = "돌진 스킬 사용 허용", Default = config.comboDash, Persist = false,
+	Callback = function(value) api:SetCombo(config.comboEnabled, nil, value) end,
+})
+comboLabel = comboSection:Label({Id = "combo-status", Text = "현재 선택한 대상의 연계 상태 대기"})
+
+comboSection:Button({
+	Id = "skill-conditions", Text = "남은 스킬 사용 상태", ActionText = "확인",
+	Callback = function()
+		local lines = {}
+		for _, skill in ipairs(api:GetSkillDiagnostics()) do
+			lines[#lines + 1] = skill.name .. ": " .. skill.reason .. " · " .. skill.profile.role
+		end
+		window:Notify({Title = "스킬 사용 조건", Content = table.concat(lines, "\n"), Kind = "Secondary"})
+	end,
+})
+
+
+local aimSection = tab:Section({Title = "사일런트 에임", Description = "결투 중에는 실제 상대만 고정합니다. 상대 확인이 끊기면 대기하고 종료 후 설정한 대상으로 복귀합니다."})
+duelLabel = aimSection:Label({Id = "duel-target", Text = "결투 상태 확인 중"})
+aimControl = aimSection:Toggle({
+	Id = "silent-aim", Text = "사일런트 에임 사용", Default = config.aimEnabled, Persist = false,
+	Callback = function(value) api:SetAim(value) end,
+})
+aimModeControl = aimSection:Dropdown({
+	Id = "aim-mode", Text = "자동으로 고를 대상", Searchable = false, Persist = false,
+	Options = {{Value = "Player", Label = "가까운 플레이어"}, {Value = "NPC", Label = "가까운 NPC"}},
+	Default = config.aimMode, Callback = function(value) api:SetAim(config.aimEnabled, value) end,
+})
+aimRangeControl = aimSection:Slider({
+	Id = "aim-range", Text = "대상 탐색 거리", Min = 50, Max = 3000, Step = 50,
+	Suffix = "스터드", Default = config.aimRange, Persist = false,
+	Callback = function(value) api:SetAim(config.aimEnabled, nil, value) end,
+})
+targetLabel = aimSection:Label({Id = "aim-target", Text = config.aimEnabled and "현재 대상 확인 중" or "사일런트 에임 꺼짐"})
+
+local skillsSection = tab:Section({Title = "사용하지 않을 스킬", Description = "선택한 스킬은 무작위 사용에서 제외됩니다."})
+excludedControl = skillsSection:Dropdown({
+	Id = "excluded-skills", Text = "제외할 스킬", Multi = true, Searchable = true,
+	Placeholder = "제외할 스킬 선택", Options = {}, Default = {}, Persist = false,
+	Callback = function(values) api:SetExcluded(values) end,
+})
+skillsSection:Button({Id = "refresh-skills", Text = "장비 목록 새로고침", ActionText = "새로고침", Callback = refreshOptions})
+skillsSection:Button({Id = "allow-all", Text = "스킬 제외 해제", ActionText = "모두 허용", Callback = function() api:SetExcluded({}) end})
+local positionSection = tab:Section({Title = "버튼 고정 위치", Description = "슬라이더를 움직이면 즉시 적용됩니다. 정한 위치는 자동으로 저장됩니다."})
+xControl = positionSection:Slider({
+	Id = "position-x", Text = "가로 위치", Min = 0, Max = 100, Step = 0.1,
+	Suffix = "%", Default = config.x, Persist = false,
+	Callback = function(value) api:SetPosition(value, config.y) end,
+})
+yControl = positionSection:Slider({
+	Id = "position-y", Text = "세로 위치", Min = 0, Max = 100, Step = 0.1,
+	Suffix = "%", Default = config.y, Persist = false,
+	Callback = function(value) api:SetPosition(config.x, value) end,
+})
+positionSection:Button({
+	Id = "reset-position", Text = "버튼 위치 초기화", ActionText = "기본 위치",
+	Callback = function() api:SetPosition(83.4, 50) end,
+})
+local saveSection = tab:Section({Title = "설정 저장"})
+saveLabel = saveSection:Label({
+	Id = "save-status", Text = saveError and ("설정 읽기 오류 · " .. saveError) or "변경한 설정은 자동 저장됩니다",
+})
+saveSection:Button({Id = "save-now", Text = "설정 파일 저장", ActionText = "지금 저장", Callback = function() dirty = true; saveNow() end})
+saveSection:Button({Id = "close-settings", Text = "설정창 접기", ActionText = "접기", Callback = function() window:Minimize() end})
+refreshOptions()
+
+local refreshPending = false
+local function toolChanged(object)
+	if not alive then return end
+	skillState.dirty = true
+	if refreshPending then return end
+	refreshPending = true
+	task.delay(0.2, function()
+		refreshPending = false
+		if alive then refreshOptions() end
+	end)
+end
+local function watchCharacter(character)
+	for _, connection in ipairs(characterConnections) do connection:Disconnect() end
+	characterConnections = {}
+	if character then
+		characterConnections[#characterConnections + 1] = character.ChildAdded:Connect(toolChanged)
+		characterConnections[#characterConnections + 1] = character.ChildRemoved:Connect(toolChanged)
+		characterConnections[#characterConnections + 1] = character.AttributeChanged:Connect(function() skillState.dirty = true end)
+	end
+	skillState.dirty = true
+end
+local backpack = player:FindFirstChildOfClass("Backpack")
+if backpack then
+	connect(backpack.ChildAdded, toolChanged)
+	connect(backpack.ChildRemoved, toolChanged)
+end
+connect(player.CharacterAdded, watchCharacter)
+watchCharacter(player.Character)
+connect(player.ChildAdded, function(object)
+	if object:IsA("Backpack") then
+		skillState.dirty = true
+		watchCharacter(player.Character)
+	end
+end)
+local stats = player:FindFirstChild("PlayerStats")
+if stats then
+	for _, name in ipairs({"DFName", "SwordName", "FightingStyle", "Misc"}) do
+		local value = stats:FindFirstChild(name)
+		if value then connect(value.Changed, function() skillState.dirty = true end) end
+	end
+end
+
+
+
+connect(workspace.DescendantAdded, function(object)
+	if object:IsA("Humanoid") then npcHumanoids[object] = true; aimScanAt = 0 end
+end)
+connect(workspace.DescendantRemoving, function(object)
+	if npcHumanoids[object] then npcHumanoids[object] = nil; aimScanAt = 0 end
+end)
+for _, object in ipairs(workspace:GetDescendants()) do if object:IsA("Humanoid") then npcHumanoids[object] = true end end
+if config.aimEnabled then
+	local ok, installed, reason = pcall(installAim)
+	if not ok or not installed then
+		aimError = tostring(ok and reason or installed)
+		config.aimEnabled = false
+		aimControl:Set(false, true)
+		targetLabel:SetText("조준 보정 오류 · " .. aimError)
+	end
+end
+connect(RunService.Heartbeat, function()
+	if not alive then return end
+	local ok, reason = pcall(function() local now = os.clock(); updateAim(now); sampleCombo(now) end)
+	if not ok then
+		aimError = tostring(reason)
+		config.aimEnabled = false
+		clearAimTarget()
+		aimControl:Set(false, true)
+		targetLabel:SetText("조준 보정 오류 · " .. aimError)
+	end
+end)
+
+connect(stopButton.Activated, function()
+	if stopped then api:Resume() else api:StopNow() end
+end)
+connect(modeButton.Activated, function() api:ToggleAimMode() end)
+connect(autoButton.Activated, function() api:ToggleAuto() end)
+connect(canvas:GetPropertyChangedSignal("AbsoluteSize"), layoutAutoButton)
+layoutAutoButton()
+connect(RunService.Heartbeat, function()
+	local now = os.clock()
+	if not alive or stopped or not autoEnabled or busy or autoQueued or now < nextAuto then return end
+	autoQueued = true
+	local token = autoEpoch
+	task.spawn(function()
+		local ok, result = pcall(api.UseRandom, api, token)
+		autoQueued = false
+		nextAuto = os.clock() + (config.comboEnabled and 0.05 or 0.15)
+		if not ok and alive and token == autoEpoch then
+			skillState.error, skillState.dirty = tostring(result), true
+			nextAuto = os.clock() + 1
+			show("스킬 구성 복구 대기", 0.8)
+			warn("자동 스킬 사용 재시도 대기: " .. tostring(result))
+		end
+	end)
+end)
+
+connect(button.Activated, function() api:UseRandom() end)
+connect(gui.Destroying, function() api:Destroy() end)
+env[key] = api
+updateAim(os.clock())
+return api
