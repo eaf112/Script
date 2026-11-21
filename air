@@ -1,0 +1,807 @@
+local function newPilot()
+	local pilot = {target = nil, targetSince = 0, readyAt = 0, burstUntil = 0, restUntil = 0, cooling = false, direction = nil, elapsed = 0, breakUntil = 0, breakSide = 1, recovering = false, breakArmed = true}
+	local random = Random.new()
+	local function unit(v, fallback)
+		return v.Magnitude > 0.001 and v.Unit or fallback
+	end
+	local function intercept(relative, velocity, speed)
+		local a = velocity:Dot(velocity) - speed * speed
+		local b = 2 * relative:Dot(velocity)
+		local c = relative:Dot(relative)
+		local t
+		if math.abs(a) < 0.001 then
+			if math.abs(b) > 0.001 then t = -c / b end
+		else
+			local discriminant = b * b - 4 * a * c
+			if discriminant >= 0 then
+				local root = math.sqrt(discriminant)
+				local t1, t2 = (-b - root) / (2 * a), (-b + root) / (2 * a)
+				if t1 > 0 then t = t1 end
+				if t2 > 0 and (not t or t2 < t) then t = t2 end
+			end
+		end
+		return t and t > 0 and math.min(t, 2.5) or 0
+	end
+	local function turn(current, desired, limit)
+		local dot = math.clamp(current:Dot(desired), -1, 1)
+		local angle = math.acos(dot)
+		if angle <= limit then return desired end
+		local axis = current:Cross(desired)
+		if axis.Magnitude < 0.001 then
+			axis = current:Cross(Vector3.new(0, 1, 0))
+			if axis.Magnitude < 0.001 then axis = current:Cross(Vector3.new(1, 0, 0)) end
+		end
+		return CFrame.fromAxisAngle(axis.Unit, limit) * current
+	end
+	function pilot:Reset()
+		self.target, self.direction = nil, nil
+		self.readyAt, self.burstUntil, self.restUntil = 0, 0, 0
+		self.cooling = false
+		self.breakUntil, self.recovering = 0, false
+		self.breakArmed = true
+	end
+	function pilot:Step(s, dt, settings)
+		self.elapsed = self.elapsed + dt
+		local now = self.elapsed
+		local own, selected, best, held = s.own, nil, math.huge, nil
+		for _, candidate in ipairs(s.targets) do
+			local relative = candidate.position - own.position
+			local distance = relative.Magnitude
+			if distance > 1 and distance < settings.range then
+				local dot = own.forward:Dot(relative.Unit)
+				local score = distance * (1.4 - dot * 0.65)
+				score = score * (0.8 + math.clamp(candidate.hp, 0, 1) * 0.2)
+				if candidate.forward:Dot(-relative.Unit) > 0.8 and dot < 0 then score = score * 0.78 end
+				if candidate.id == self.target then held = {candidate = candidate, score = score} end
+				if score < best then best, selected = score, candidate end
+			end
+		end
+		if held and (now - self.targetSince < 1.4 or best > held.score * 0.7) then selected = held.candidate end
+		if selected and selected.id ~= self.target then
+			self.target, self.targetSince = selected.id, now
+			self.readyAt = now + random:NextNumber(0.14, 0.23)
+			self.burstUntil, self.restUntil = 0, 0
+			self.breakArmed = true
+		elseif not selected then
+			self.target = nil
+		end
+		local desired = own.forward
+		local aim, distance, mode = nil, 0, "탐색"
+		if selected then
+			local relative = selected.position - own.position
+			distance = relative.Magnitude
+			local flightTime = s.hitscan and 0 or intercept(relative, selected.velocity - own.velocity, s.bulletSpeed)
+			aim = selected.position + (selected.velocity - own.velocity) * flightTime + Vector3.new(0, 15 * flightTime * flightTime, 0)
+			local offset = own.right * math.sin(now * 1.7) + own.up * math.sin(now * 1.13 + 1)
+			local noise = math.tan(math.rad(settings.error)) * distance
+			desired = unit(aim + offset * noise - own.position, own.forward)
+			mode = "추격"
+			if distance > 250 then self.breakArmed = true end
+			if distance < 130 and self.breakArmed and relative.Unit:Dot(own.forward) > -0.2 and now > self.breakUntil then
+				self.breakUntil = now + 0.85
+				self.breakSide = own.right:Dot(relative) > 0 and -1 or 1
+				self.breakArmed = false
+			end
+		else
+			local tangent = Vector3.new(-own.position.Z, 0, own.position.X)
+			local inward = Vector3.new(-own.position.X, 0, -own.position.Z)
+			desired = unit(tangent + inward * 0.35 + Vector3.new(0, (650 - own.position.Y) * 2, 0), own.forward)
+		end
+		if s.threat and distance > 180 then
+			local weave = own.right * math.sin(now * 2.7) * 0.55 + own.up * math.sin(now * 1.7) * 0.22
+			desired = unit(desired + weave, own.forward)
+			mode = "회피 기동"
+		end
+		local speed = own.velocity.Magnitude
+		local minimum = s.minSpeed or 90
+		if speed < minimum then self.recovering = true end
+		if speed > minimum * 1.15 then self.recovering = false end
+		if now < self.breakUntil then
+			local forward = unit(Vector3.new(own.forward.X, 0, own.forward.Z), Vector3.new(0, 0, -1))
+			local right = unit(Vector3.new(own.right.X, 0, own.right.Z), forward:Cross(Vector3.new(0, 1, 0)))
+			desired = unit(forward + right * self.breakSide * 0.45 + Vector3.new(0, math.clamp((550 - own.position.Y) / 900, -0.15, 0.12), 0), forward)
+			mode = "근접 이탈"
+		end
+		if self.recovering then
+			local forward = unit(Vector3.new(own.forward.X, 0, own.forward.Z), Vector3.new(0, 0, -1))
+			desired = unit(forward + Vector3.new(0, own.position.Y > 550 and -0.12 or 0, 0), forward)
+			mode = "속도 회복"
+		else
+			local climb = speed < minimum * 1.4 and 0.28 or 0.45
+			if desired.Y > climb or desired.Y < -0.4 then
+				local y = math.clamp(desired.Y, -0.4, climb)
+				local fallback = unit(Vector3.new(own.forward.X, 0, own.forward.Z), Vector3.new(0, 0, -1))
+				local horizontal = unit(Vector3.new(desired.X, 0, desired.Z), fallback)
+				desired = horizontal * math.sqrt(1 - y * y) + Vector3.new(0, y, 0)
+			end
+		end
+		local radial = Vector3.new(own.position.X, 0, own.position.Z)
+		local predicted = own.position + own.velocity * 2.5
+		local limit = s.zoneRadius - 350
+		if radial.Magnitude > limit or Vector3.new(predicted.X, 0, predicted.Z).Magnitude > s.zoneRadius - 150 then
+			desired = unit(-radial + Vector3.new(0, math.max(0, 550 - own.position.Y), 0), own.forward)
+			mode = "구역 복귀"
+		end
+		if own.position.Y > s.ceiling - 160 then
+			desired = unit(Vector3.new(desired.X, math.min(desired.Y, -0.4), desired.Z), own.forward)
+			mode = "고도 조절"
+		end
+		if s.collision then desired, mode = s.collision, "충돌 회피" end
+		if s.avoid then desired, mode = s.avoid, "지형 회피" end
+		self.direction = turn(self.direction or own.forward, desired, math.rad(settings.turnRate) * math.min(dt, 0.05))
+		self.direction = turn(own.forward, self.direction, math.rad(75))
+		local fire = false
+		if s.heat > 0.78 or s.jammed then self.cooling = true end
+		if s.heat < 0.34 and not s.jammed then self.cooling = false end
+		local aligned = aim and own.forward:Dot(unit(aim - own.position, own.forward)) > math.cos(math.rad(2.5))
+		local attackMode = mode == "추격" or mode == "회피 기동"
+		if selected and aligned and distance > 100 and distance < s.weaponRange * 0.95 and s.clear and now >= self.readyAt and attackMode and not self.cooling then
+			if now >= self.restUntil then
+				if self.burstUntil == 0 then self.burstUntil = now + random:NextNumber(0.85, 1.5) end
+				if now < self.burstUntil then
+					fire, mode = true, "사격"
+				else
+					self.burstUntil = 0
+					self.restUntil = now + random:NextNumber(0.1, 0.2)
+				end
+			end
+		else
+			self.burstUntil = 0
+		end
+		if self.cooling and mode == "추격" then mode = "냉각" end
+		local reason = "추격"
+		if not selected then reason = "표적 없음"
+		elseif not attackMode then reason = mode
+		elseif distance <= 100 then reason = "지나치게 가까움"
+		elseif distance >= s.weaponRange * 0.95 then reason = "사거리 밖"
+		elseif not aligned then reason = "조준 정렬 중"
+		elseif not s.clear then reason = "사선 차단"
+		elseif self.cooling then reason = "냉각"
+		elseif now < self.readyAt then reason = "반응 대기"
+		elseif not fire then reason = "연사 간격"
+		else reason = "사격" end
+		return {direction = self.direction, fire = fire, target = selected, mode = mode, distance = distance, boost = (self.recovering or s.gunThreat) and not s.avoid, fireReason = reason, gunThreat = s.gunThreat}
+	end
+	return pilot
+end
+
+local function chooseEvasion(s, desired)
+	local speed = s.speed
+	local function danger(direction)
+		local score, urgent = 0, false
+		for _, hazard in ipairs(s.hazards) do
+			local relative = hazard.position - s.position
+			local velocity = hazard.velocity - direction * speed
+			local time = math.clamp(-relative:Dot(velocity) / math.max(velocity:Dot(velocity), 1), 0, math.min(hazard.remaining, 1.2))
+			local miss = (relative + velocity * time + (hazard.gravity or Vector3.zero) * (time * time * 0.5)).Magnitude
+			local radius = hazard.radius or 40
+			if time > 0.005 or relative.Magnitude < radius then
+				score = score + math.exp(-((miss / radius) ^ 2)) * (hazard.missile and 4 or 1) / (time + 0.08)
+				if miss < radius and time < 0.24 then urgent = true end
+			end
+		end
+		return score, urgent
+	end
+	local baseline, urgent = danger(desired)
+	if s.current and s.current.Magnitude > 1 then
+		local _, incoming = danger(s.current.Unit)
+		urgent = urgent or incoming
+	end
+	if baseline < 0.03 then return desired, false, urgent end
+	local choices = {desired}
+	for x = -1, 1 do
+		for y = -1, 1 do
+			for z = -1, 1 do
+				local vector = Vector3.new(x, y, z)
+				if vector.Magnitude > 0 then table.insert(choices, vector.Unit) end
+			end
+		end
+	end
+	local best, bestScore = desired, math.huge
+	for _, direction in ipairs(choices) do
+		local future = s.position + direction * speed * 1.2
+		if future.Y > s.floor and future.Y < s.ceiling - 90 and Vector3.new(future.X, 0, future.Z).Magnitude < s.zoneRadius - 100 and (not s.blocked or not s.blocked(direction)) then
+			local score = danger(direction) + (1 - direction:Dot(desired)) * 0.025
+			if s.previous then score = score + (1 - direction:Dot(s.previous)) * 0.015 end
+			if score < bestScore then best, bestScore = direction, score end
+		end
+	end
+	return best, best:Dot(desired) < 0.995, urgent
+end
+
+local function newRagePilot()
+	local pilot = {target = nil, cooling = false}
+	local function unit(v, fallback)
+		return v.Magnitude > 0.001 and v.Unit or fallback
+	end
+	function pilot:Reset()
+		self.target, self.cooling = nil, false
+	end
+	function pilot:Step(s, _, settings)
+		local own, selected, best, held = s.own, nil, math.huge, nil
+		for _, candidate in ipairs(s.targets) do
+			local distance = (candidate.position - own.position).Magnitude
+			if distance > 1 and distance < settings.range then
+				local score = distance * (0.3 + math.clamp(candidate.cockpitHp or candidate.hp, 0, 1) * 0.7)
+				if distance < s.weaponRange * 0.95 then score = score * 0.3 end
+				if candidate.firing then score = score * 0.85 end
+				if candidate.id == self.target then held = {candidate = candidate, score = score} end
+				if score < best then best, selected = score, candidate end
+			end
+		end
+		if held and held.score <= best * 1.1 then selected = held.candidate end
+		self.target = selected and selected.id or nil
+		local movement, direction = own.forward, own.forward
+		local distance, mode = 0, "탐색"
+		if selected then
+			local relative = (selected.aimPosition or selected.position) - own.position
+			local velocity = selected.velocity - own.velocity
+			local time = s.hitscan and 0 or math.min(relative.Magnitude / s.bulletSpeed, 2.5)
+			for _ = 1, 5 do
+				if not s.hitscan then time = math.min((relative + velocity * time + Vector3.new(0, 15 * time * time, 0)).Magnitude / s.bulletSpeed, 2.5) end
+			end
+			direction = unit(relative + velocity * time + Vector3.new(0, 15 * time * time, 0), own.forward)
+			distance = (selected.position - own.position).Magnitude
+			local radial = unit(own.position - selected.position, -own.forward)
+			local tangent = unit(radial:Cross(Vector3.new(0, 1, 0)), own.right)
+			local preferred = math.clamp(s.weaponRange * 0.5, 180, 500)
+			if distance > preferred * 1.4 then
+				movement, mode = -radial, "고속 접근"
+			else
+				movement = unit(tangent * 0.9 + radial * math.clamp((preferred - distance) / preferred * 2, -1, 1.5), tangent)
+				mode = "횡이동 사격"
+			end
+			local altitude = math.clamp(selected.position.Y, s.floor + 70, s.ceiling - 180)
+			movement = unit(Vector3.new(movement.X, math.clamp((altitude - own.position.Y) / 250, -0.6, 0.8), movement.Z), movement)
+		else
+			movement = unit(Vector3.new(-own.position.Z - own.position.X * 0.3, (s.floor + 100 - own.position.Y) * 3, own.position.X - own.position.Z * 0.3), own.forward)
+		end
+		local radial = Vector3.new(own.position.X, 0, own.position.Z)
+		if radial.Magnitude > s.zoneRadius - 300 then
+			movement, mode = unit(-radial + Vector3.new(0, 100, 0), -own.forward), "구역 복귀"
+		end
+		if own.position.Y < s.floor then
+			movement, mode = unit(Vector3.new(movement.X * 0.5, 1, movement.Z * 0.5), Vector3.new(0, 1, 0)), "고도 확보"
+		elseif own.position.Y > s.ceiling - 120 then
+			movement, mode = unit(Vector3.new(movement.X, -0.8, movement.Z), Vector3.new(0, -1, 0)), "고도 조절"
+		end
+		if s.collision then movement, mode = s.collision, "충돌 회피" end
+		if s.avoid then movement, mode = s.avoid, "지형 회피" end
+		if not selected then direction = movement end
+		if s.heat > 0.92 or s.jammed then self.cooling = true end
+		if s.heat < 0.4 and not s.jammed then self.cooling = false end
+		local fire = selected ~= nil and distance > 35 and distance < s.weaponRange * 0.98 and s.clear and not self.cooling
+		local reason = "사격"
+		if not selected then reason = "표적 없음"
+		elseif self.cooling then reason = "냉각"
+		elseif not s.clear then reason = "사선 차단"
+		elseif distance >= s.weaponRange * 0.98 then reason = "사거리 밖"
+		elseif distance <= 35 then reason = "충돌 거리" end
+		return {direction = direction, movement = movement, fire = fire, target = selected, mode = mode, distance = distance, boost = true, snap = true, fireReason = reason}
+	end
+	return pilot
+end
+
+if game.PlaceId ~= 88661816960259 then error("현재 게임용 스크립트입니다.") end
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local player = Players.LocalPlayer
+local client = player:WaitForChild("PlayerScripts"):WaitForChild("Klijent", 10)
+assert(client, "게임 조작 스크립트를 찾지 못했습니다.")
+local function loadModule(parent, name)
+	local module = parent:FindFirstChild(name)
+	assert(module, "게임 모듈이 없습니다: " .. name)
+	local ok, value = pcall(require, module)
+	assert(ok and type(value) == "table", "게임 모듈을 읽지 못했습니다: " .. name .. " " .. tostring(value))
+	return value
+end
+local Controls = loadModule(client, "Kontrole")
+local Combat = loadModule(client, "Paljba")
+local Damage = loadModule(client, "Ostecenja")
+local modules = game:GetService("ReplicatedStorage"):WaitForChild("Moduli")
+local Weapons = loadModule(modules, "Oruzje")
+local Status = loadModule(modules, "Statusi")
+local World = loadModule(modules, "Svet")
+local Balance = loadModule(modules, "Balans")
+local FlightModel = loadModule(modules, "LetModel")
+assert(type(Controls.Azuriraj) == "function" and type(Combat.Info) == "function" and type(Weapons.Naoruzanje) == "function", "게임 조작 구조가 변경되었습니다.")
+local ok, UI = pcall(function()
+	return loadstring(game:HttpGet("https://raw.githubusercontent.com/eaf112/Script/refs/heads/main/ui-lib"))()
+end)
+assert(ok and UI, "UI 라이브러리 로드 실패: " .. tostring(UI))
+local window = UI:CreateWindow({Id = "flight-combat", Title = "공중전", Theme = "CodexDark", Locale = "ko", CloseBehavior = "Minimize"})
+local section = window:Tab({Id = "combat", Title = "전투"}):Section({Title = "자동 전투"})
+local settings = {mode = "Legit", range = 2400, turnRate = 100, error = 0.12, botsOnly = false, secondary = true, evasion = true, blink = true, pickups = true}
+local pilot = newPilot()
+local ragePilot = newRagePilot()
+local enabled, destroyed = false, false
+local original, wrapped, toggle, rageToggle
+local originalStep, wrappedStep, rageFlight
+local rageToken = {}
+local state = {mode = "대기", fire = false}
+local ownPlane, ownRoot, targetModel
+local weapon = {speed = 1400, range = 950, hitscan = false, slots = {}}
+local samples = {}
+local candidates = {}
+local projectiles, gunWaves, pickupAttempts = {}, {}, {}
+local jump, jumpAt, gunAt, defenseAt = nil, 0, 0, 0
+local defenseMovement, defenseUrgent, defenseChanged = nil, false, false
+local hazards = {}
+local scanAt, displayAt, secondaryAt = 0, 0, 0
+local obstruction, collision, clear, gunThreat = nil, nil, false, false
+local obstacleParams = RaycastParams.new()
+obstacleParams.FilterType = Enum.RaycastFilterType.Include
+local sightParams = RaycastParams.new()
+sightParams.FilterType = Enum.RaycastFilterType.Include
+local statusLabel = section:Label({Id = "state", Text = "대기 중"})
+local targetLabel = section:Label({Id = "target", Text = "표적 없음"})
+local function releaseFire()
+	Controls.pucaPrimarno = false
+	Controls.pucaSekundarno = false
+	Controls.pucaTercijarno = false
+end
+local function stop()
+	local wasEnabled = enabled
+	enabled = false
+	if wrapped and Controls.Azuriraj == wrapped then Controls.Azuriraj = original end
+	if wrappedStep and FlightModel.Korak == wrappedStep then FlightModel.Korak = originalStep end
+	if rageFlight and ownRoot and ownRoot.Parent then
+		rageFlight.cf = ownRoot.CFrame
+		rageFlight.smer = ownRoot.AssemblyLinearVelocity.Magnitude > 1 and ownRoot.AssemblyLinearVelocity.Unit or ownRoot.CFrame.LookVector
+		rageFlight.rate = Vector3.zero
+	end
+	wrappedStep, rageFlight = nil, nil
+	wrapped = nil
+	if wasEnabled then releaseFire() end
+	pilot:Reset()
+	ragePilot:Reset()
+	targetModel = nil
+	state = {mode = "대기", fire = false}
+	jump, defenseMovement = nil, nil
+	defenseUrgent, defenseChanged = false, false
+	table.clear(projectiles)
+	table.clear(gunWaves)
+	table.clear(hazards)
+	defenseAt, gunAt = 0, 0
+	if toggle then toggle:Set(false, true) end
+	if rageToggle then rageToggle:Set(false, true) end
+end
+window:OnDestroy(function()
+	destroyed = true
+	stop()
+	table.clear(samples)
+	table.clear(pickupAttempts)
+end)
+
+local function roots(model)
+	return model.PrimaryPart or model:FindFirstChild("Koren")
+end
+local function velocity(part, now)
+	local last = samples[part]
+	local result = part.AssemblyLinearVelocity
+	if last and now - last.time > 0.03 then
+		local measured = (part.Position - last.position) / (now - last.time)
+		if measured.Magnitude < 1500 then result = last.velocity:Lerp(measured, 0.6) end
+	end
+	samples[part] = {position = part.Position, time = now, velocity = result}
+	return result
+end
+local function scan(now)
+	local aircraft = workspace:FindFirstChild("Avioni")
+	ownPlane, ownRoot, candidates = nil, nil, {}
+	local keep = {}
+	if aircraft then
+		for _, plane in ipairs(aircraft:GetChildren()) do
+			if plane:IsA("Model") then
+				local root = roots(plane)
+				if root and root:IsA("BasePart") then
+					keep[root] = true
+					local vel = velocity(root, now)
+					if plane == Damage.mojModel then
+						ownPlane, ownRoot = plane, root
+					elseif plane:GetAttribute("Vlasnik") ~= player.UserId and plane.Name ~= "Avion_" .. player.UserId and not plane:GetAttribute("Uklanja") and not plane:GetAttribute("PilotMrtav") and not plane:GetAttribute("Zastita") and not Status.Duh(plane) then
+						local bot = plane.Name:match("^Bot_") ~= nil
+						if not settings.botsOnly or bot then
+							local hp = plane:GetAttribute("HP_Trup") or 1
+							if hp > 0 then
+								local cockpit = plane:FindFirstChild("Sekcija_Kokpit")
+								table.insert(candidates, {id = plane, position = root.Position, aimPosition = cockpit and cockpit:IsA("BasePart") and cockpit.Position or root.Position, cockpitHp = plane:GetAttribute("HP_Kokpit"), velocity = vel, forward = root.CFrame.LookVector, hp = hp, firing = plane:GetAttribute("PucaP") == true})
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	for part in pairs(samples) do if not keep[part] then samples[part] = nil end end
+	local terrain = {workspace.Terrain}
+	for _, name in ipairs({"Svet", "Brodovi"}) do
+		local folder = workspace:FindFirstChild(name)
+		if folder then table.insert(terrain, folder) end
+	end
+	obstacleParams.FilterDescendantsInstances = terrain
+	local sight = table.clone(terrain)
+	if aircraft then
+		for _, plane in ipairs(aircraft:GetChildren()) do
+			if plane ~= ownPlane then table.insert(sight, plane) end
+		end
+	end
+	sightParams.FilterDescendantsInstances = sight
+	weapon = {speed = 1400, range = 0, hitscan = false, slots = {}}
+	if ownPlane and ownPlane:GetAttribute("Model") then
+		local loadout = Weapons.Naoruzanje(ownPlane:GetAttribute("Model"))
+		local primary
+		for _, mount in ipairs(loadout and loadout[1] or {}) do
+			if not mount.zad and Combat.NaMestu(ownPlane, mount.sek) then primary = mount break end
+		end
+		if primary and primary.def then
+			local def = primary.def
+			weapon = {speed = def.brzina or 1400, range = def.domet or 950, hitscan = def.vrsta == "zrak" or def.vrsta == "kontinualni" or def.vrsta == "plamen", slots = {}}
+		end
+		for slot = 2, 3 do
+			for _, mount in ipairs(loadout and loadout[slot] or {}) do
+				if mount.def and mount.def.vrsta == "raketa" and not mount.def.mina then weapon.slots[slot] = true end
+			end
+		end
+	end
+	obstruction, collision, clear, gunThreat = nil, nil, false, false
+	if ownRoot then
+		local pos, cf = ownRoot.Position, ownRoot.CFrame
+		local vel = samples[ownRoot].velocity
+		local horizon = math.max(180, vel.Magnitude * 2.8)
+		local forward = cf.LookVector * horizon
+		if settings.mode == "Rage" and vel.Magnitude > 5 then forward = vel.Unit * horizon end
+		local hit = workspace:Raycast(pos, forward, obstacleParams)
+		if not hit then hit = workspace:Raycast(pos + cf.RightVector * 12, forward, obstacleParams) end
+		if not hit then hit = workspace:Raycast(pos - cf.RightVector * 12, forward, obstacleParams) end
+		local low = workspace:Raycast(pos, Vector3.new(0, -160, 0), obstacleParams)
+		if hit or low or pos.Y + math.min(vel.Y, 0) * 2.8 < World.VodaY + 85 then
+			obstruction = (cf.LookVector * 0.35 + Vector3.new(0, 1, 0)).Unit
+		end
+		for _, candidate in ipairs(candidates) do
+			local relative = candidate.position - pos
+			local rv = candidate.velocity - vel
+			if relative.Magnitude > 1 and relative.Magnitude < 1100 and candidate.firing and candidate.forward:Dot(-relative.Unit) > 0.94 then gunThreat = true end
+			if rv:Dot(rv) > 1 and relative.Magnitude < 500 then
+				local time = -relative:Dot(rv) / rv:Dot(rv)
+				if not collision and time > 0 and time < 1.8 and (relative + rv * time).Magnitude < 60 then
+					local side = cf.RightVector:Dot(relative) > 0 and -1 or 1
+					collision = (cf.LookVector * 0.3 + cf.RightVector * side + Vector3.new(0, 0.5, 0)).Unit
+				end
+			end
+		end
+		if targetModel and targetModel.Parent then
+			local root = roots(targetModel)
+			if root then
+				local start = pos + cf.LookVector * 32
+				local result = workspace:Raycast(start, root.Position - start, sightParams)
+				clear = not result or result.Instance:IsDescendantOf(targetModel)
+			end
+		end
+	end
+end
+
+local function updateHazards(now)
+	hazards = {}
+	for key, projectile in pairs(projectiles) do
+		local def = projectile.def
+		local dt = math.min(now - projectile.updated, 0.25)
+		projectile.updated = now
+		if now > projectile.expires then
+			projectiles[key] = nil
+		else
+			local steps = math.max(1, math.ceil(dt / 0.025))
+			local step = dt / steps
+			for _ = 1, steps do
+				projectile.speed = math.min(def.maxBrzina or projectile.speed, projectile.speed + (def.ubrzanje or 0) * step)
+				local target = projectile.target
+				if target and target.Parent and not Status.Duh(target) then
+					local root = roots(target)
+					if root then
+						local time = math.min(3, (root.Position - projectile.position).Magnitude / math.max(projectile.speed, 1))
+						local relative = root.Position + root.AssemblyLinearVelocity * time - projectile.position
+						if relative.Magnitude > 0.01 then
+							local desired = relative.Unit
+							local angle = math.acos(math.clamp(projectile.direction:Dot(desired), -1, 1))
+							local turn = math.rad(def.okret or 0) * step
+							if def.magnetna and Status.Aktivno(target, "magnet") then turn = turn * 1.8 end
+							local direction = projectile.direction:Lerp(desired, angle > 0.001 and math.min(1, turn / angle) or 1)
+							if direction.Magnitude > 0.001 then projectile.direction = direction.Unit end
+						end
+					end
+				end
+				projectile.velocity = projectile.direction * projectile.speed
+				projectile.position = projectile.position + projectile.velocity * step
+			end
+			if ownRoot and (projectile.position - ownRoot.Position).Magnitude < 1600 then
+				table.insert(hazards, {position = projectile.position, velocity = projectile.velocity, radius = math.max(def.blizina or 0, def.radius or 0, 30) + 22, remaining = projectile.expires - now, missile = true})
+			end
+		end
+	end
+	if now >= gunAt then
+		gunAt = now + 0.09
+		for _, candidate in ipairs(candidates) do
+			local relative = ownRoot and ownRoot.Position - candidate.position
+			if relative and relative.Magnitude > 1 and relative.Magnitude < 1800 and candidate.firing and candidate.forward:Dot(relative.Unit) > 0.65 then
+				local loadout = Weapons.Naoruzanje(candidate.id:GetAttribute("Model"))
+				for _, mount in ipairs(loadout and loadout[1] or {}) do
+					if not mount.zad and mount.def and Combat.NaMestu(candidate.id, mount.sek) then
+						local def = mount.def
+						local speed = def.brzina or 1400
+						if def.vrsta == "zrak" or def.vrsta == "kontinualni" then speed = 12000 end
+						table.insert(gunWaves, {position = candidate.position + candidate.forward * 32, velocity = candidate.forward * speed + candidate.velocity, born = now, expires = now + math.min(2, (def.domet or 1000) / speed), gravity = Vector3.new(0, -30, 0), radius = 36})
+						break
+					end
+				end
+			end
+		end
+	end
+	for index = #gunWaves, 1, -1 do
+		local wave = gunWaves[index]
+		if now > wave.expires or #gunWaves > 128 then
+			table.remove(gunWaves, index)
+		else
+			local age = now - wave.born
+			table.insert(hazards, {position = wave.position + wave.velocity * age + wave.gravity * (age * age * 0.5), velocity = wave.velocity + wave.gravity * age, gravity = wave.gravity, radius = wave.radius, remaining = wave.expires - now})
+		end
+	end
+end
+
+local function safePoint(point)
+	if point.Y < World.VodaY + 90 or point.Y > World.ZonaPlafon - 100 or Vector3.new(point.X, 0, point.Z).Magnitude > World.ZonaRadijus - 150 then return false end
+	for _, ray in ipairs({Vector3.new(0, -65, 0), Vector3.new(0, 35, 0), Vector3.new(35, 0, 0), Vector3.new(-35, 0, 0), Vector3.new(0, 0, 35), Vector3.new(0, 0, -35)}) do
+		if workspace:Raycast(point, ray, obstacleParams) then return false end
+	end
+	return true
+end
+
+local function collectPickup(now)
+	if not settings.pickups or jump or now < jumpAt then return end
+	local folder = workspace:FindFirstChild("Pojacanja")
+	if not folder then return end
+	local serverNow, selected, best = workspace:GetServerTimeNow(), nil, -math.huge
+	local function remaining(kind) return math.max(0, (ownPlane:GetAttribute("Ef_" .. kind) or 0) - serverNow) end
+	for part, untilTime in pairs(pickupAttempts) do if not part.Parent or now > untilTime then pickupAttempts[part] = nil end end
+	for _, part in ipairs(folder:GetChildren()) do
+		if part:IsA("BasePart") and not pickupAttempts[part] and (not part:GetAttribute("Kraj") or part:GetAttribute("Kraj") > serverNow + 0.7) then
+			local kind, priority = part:GetAttribute("Tip"), 0
+			if kind == "stit" and remaining("stit") < 1.1 then priority = 100 end
+			if kind == "duh" and remaining("duh") < 1.1 then priority = #hazards > 0 and 85 or 65 end
+			if kind == "popravka" and math.min(ownPlane:GetAttribute("HP_Trup") or 1, ownPlane:GetAttribute("HP_Kokpit") or 1) < 0.8 then priority = 90 end
+			if (kind == "steta2" or kind == "trostruka" or kind == "brzaPaljba") and remaining(kind) < 1.1 then priority = 25 end
+			local score = priority - (part.Position - ownRoot.Position).Magnitude / 2500
+			if priority > 0 and score > best and safePoint(part.Position) then selected, best = part, score end
+		end
+	end
+	if selected then
+		jump = {position = selected.Position, part = selected, kind = selected:GetAttribute("Tip"), untilTime = now + 0.5, reason = "강화 아이템 수집"}
+		pickupAttempts[selected] = now + 10
+		jumpAt = now + 1.1
+	end
+end
+
+local function update(dt, cf)
+	local now = os.clock()
+	if now >= scanAt then scanAt = now + (settings.mode == "Rage" and 0.035 or 0.1) scan(now) end
+	if not ownPlane or not ownRoot or not ownRoot.Parent then
+		releaseFire()
+		pilot:Reset()
+		ragePilot:Reset()
+		state = {mode = "출격 대기", fire = false}
+		return nil
+	end
+	if ownPlane:GetAttribute("PilotMrtav") then
+		releaseFire()
+		pilot:Reset()
+		ragePilot:Reset()
+		state = {mode = "조종사 사망", fire = false}
+		return nil
+	end
+	local frame = cf or ownRoot.CFrame
+	local mod = Status.Mod(ownPlane)
+	local stats = Balance[ownPlane:GetAttribute("Model")]
+	local controller = settings.mode == "Rage" and ragePilot or pilot
+	local result = controller:Step({
+		own = {position = ownRoot.Position, velocity = samples[ownRoot].velocity, forward = frame.LookVector, right = frame.RightVector, up = frame.UpVector},
+		targets = candidates, bulletSpeed = weapon.speed, weaponRange = weapon.range, hitscan = weapon.hitscan,
+		heat = Combat.toplota or 0, jammed = Combat.zaglavljen, clear = clear, avoid = obstruction,
+		threat = Combat.pretnja ~= nil or gunThreat, gunThreat = gunThreat, zoneRadius = World.ZonaRadijus, ceiling = World.ZonaPlafon, collision = collision, minSpeed = stats and stats.vMin * 1.4 or 82,
+		floor = (World.MaxTeren or 395) + 180,
+	}, dt, settings)
+	if settings.mode == "Rage" then
+		if now >= defenseAt then
+			defenseAt = now + 0.035
+			updateHazards(now)
+			local previousMovement = defenseMovement
+			defenseMovement, defenseChanged, defenseUrgent = result.movement, false, false
+			if settings.evasion then
+				defenseMovement, defenseChanged, defenseUrgent = chooseEvasion({position = ownRoot.Position, current = ownRoot.AssemblyLinearVelocity, speed = stats and (stats.vZid or stats.vMax) or 200, hazards = hazards, floor = (World.MaxTeren or 395) + 130, ceiling = World.ZonaPlafon, zoneRadius = World.ZonaRadijus, previous = previousMovement, blocked = function(direction) return workspace:Raycast(ownRoot.Position, direction * 160, obstacleParams) ~= nil end}, result.movement)
+			end
+		end
+		if defenseChanged and not obstruction and not collision then result.movement, result.mode = defenseMovement, "탄로 예측 회피" end
+		if jump and (now > jump.untilTime or (jump.part and not jump.part.Parent)) then jump = nil end
+		collectPickup(now)
+		if settings.blink and defenseUrgent and not jump and now >= jumpAt and not Status.Aktivno(ownPlane, "stit") then
+			local point = ownRoot.Position + result.movement * 180
+			point = Vector3.new(point.X, math.max(point.Y, (World.MaxTeren or 395) + 180), point.Z)
+			if safePoint(point) then
+				jump = {position = point, untilTime = now + 0.12, reason = "긴급 순간 회피"}
+				jumpAt = now + 1.1
+			end
+		end
+		if jump then result.mode, result.fire = jump.reason, false end
+	end
+	state = result
+	local previous = targetModel
+	targetModel = result.target and result.target.id or nil
+	if previous ~= targetModel then
+		clear = false
+		if settings.mode == "Rage" and targetModel then
+			local targetRoot = roots(targetModel)
+			if targetRoot then
+				local hit = workspace:Raycast(ownRoot.Position, targetRoot.Position - ownRoot.Position, sightParams)
+				clear = not hit or hit.Instance:IsDescendantOf(targetModel)
+			end
+		end
+		result.fire = result.fire and clear
+	end
+	Controls.cilj = result.direction
+	Controls.pucaPrimarno = result.fire and mod.oruzje ~= false
+	Controls.pucaSekundarno, Controls.pucaTercijarno = false, false
+	local lock = Combat.cilj
+	if settings.secondary and mod.oruzje ~= false and mod.zahvat ~= false and lock and lock.model == targetModel and (result.mode == "사격" or (settings.mode == "Rage" and result.fire)) and now >= secondaryAt then
+		if lock.zakljucan or (not lock.vodjeno and result.distance < 600) then
+			Controls.pucaSekundarno = true
+			secondaryAt = now + (settings.mode == "Rage" and 0.12 or 0.7)
+			if settings.mode == "Rage" then
+				Controls.pucaSekundarno = weapon.slots[2] == true
+				Controls.pucaTercijarno = weapon.slots[3] == true
+			end
+		end
+	end
+	return {cilj = result.direction, roll = 0, yaw = 0, boost = result.boost, _flightCombat = settings.mode == "Rage" and rageToken or nil}
+end
+
+local function installRageStep()
+	local base = FlightModel.Korak
+	assert(type(base) == "function", "기체 제어 함수를 찾지 못했습니다.")
+	originalStep = base
+	local handler
+	handler = function(model, dt, input)
+		local cf, velocity = base(model, dt, input)
+		if not enabled or wrappedStep ~= handler or settings.mode ~= "Rage" or input._flightCombat ~= rageToken then return cf, velocity end
+		if not ownRoot or not ownRoot.Parent or not state.snap or (model.mod and model.mod.kontrole == false) then return cf, velocity end
+		local success, frame, motion = pcall(function()
+			local up = math.abs(state.direction:Dot(Vector3.new(0, 1, 0))) > 0.98 and Vector3.new(0, 0, 1) or Vector3.new(0, 1, 0)
+			local position = jump and jump.position or ownRoot.Position
+			if jump and not jump.applied then
+				jump.applied = true
+				samples[ownRoot] = {position = position, time = os.clock(), velocity = Vector3.zero}
+			end
+			local snapped = CFrame.lookAt(position, position + state.direction, up)
+			local speed = model.stat.vZid or model.stat.vMax
+			local movement = state.movement or state.direction
+			ownRoot.CFrame = snapped
+			model.cf, model.smer, model.rate, model.v = snapped, movement, Vector3.zero, speed
+			rageFlight = model
+			return snapped, jump and Vector3.zero or movement * speed
+		end)
+		if not success then
+			stop()
+			window:Notify({Title = "자동 전투 중지", Content = tostring(frame), Kind = "Danger"})
+			return cf, velocity
+		end
+		return frame, motion
+	end
+	wrappedStep = handler
+	FlightModel.Korak = handler
+end
+
+local function start()
+	if enabled or destroyed then return end
+	if settings.mode == "Rage" then installRageStep() end
+	local base = Controls.Azuriraj
+	original = base
+	local handler
+	handler = function(dt, rig, cf)
+		local input = base(dt, rig, cf)
+		if not enabled or wrapped ~= handler then return input end
+		if not Controls.aktivno then
+			releaseFire()
+			pilot:Reset()
+			ragePilot:Reset()
+			state = {mode = "출격 대기", fire = false}
+			return input
+		end
+		local success, result = pcall(update, math.min(dt, 0.1), cf)
+		if not success then
+			stop()
+			window:Notify({Title = "자동 전투 중지", Content = tostring(result), Kind = "Danger"})
+			return input
+		end
+		return result or input
+	end
+	wrapped = handler
+	Controls.Azuriraj = wrapped
+	enabled = true
+	scanAt = 0
+	pilot:Reset()
+	ragePilot:Reset()
+end
+
+local function selectMode(mode, value)
+	if value then
+		if enabled then stop() end
+		settings.mode = mode
+		start()
+		if toggle then toggle:Set(mode == "Legit", true) end
+		if rageToggle then rageToggle:Set(mode == "Rage", true) end
+	elseif settings.mode == mode then stop() end
+end
+toggle = section:Toggle({Id = "enabled", Text = "(Legit) 자동 전투", Default = false, Persist = false, Callback = function(value)
+	selectMode("Legit", value)
+end})
+rageToggle = section:Toggle({Id = "rage-enabled", Text = "(Rage) 자동 전투", Default = false, Persist = false, Callback = function(value)
+	selectMode("Rage", value)
+end})
+section:Button({Id = "stop", Text = "즉시 중지", ActionText = "중지", Callback = stop})
+section:Toggle({Id = "bots-only", Text = "봇만 상대", Default = false, Callback = function(value) settings.botsOnly = value pilot:Reset() ragePilot:Reset() scanAt = 0 end})
+section:Toggle({Id = "secondary", Text = "보조 무기 사용", Default = true, Callback = function(value) settings.secondary = value end})
+local defense = window:Tab({Id = "defense", Title = "회피와 강화"}):Section({Title = "Rage 방어"})
+defense:Toggle({Id = "predictive-evasion", Text = "투사체 예측 회피", Default = true, Callback = function(value) settings.evasion = value defenseAt = 0 end})
+defense:Toggle({Id = "emergency-blink", Text = "긴급 순간 회피", Default = true, Callback = function(value) settings.blink = value end})
+defense:Toggle({Id = "instant-pickups", Text = "강화 아이템 순간 수집", Default = true, Callback = function(value) settings.pickups = value if not value and jump and jump.part then jump = nil end end})
+defense:Label({Id = "defense-info", Text = "보호막·수리 우선 수집. 유령은 미사일 추적을 해제합니다."})
+local tuning = window:Tab({Id = "tuning", Title = "조절"}):Section({Title = "비행과 조준"})
+tuning:Slider({Id = "turn", Text = "Legit 회전 속도", Min = 50, Max = 150, Step = 5, Default = 100, Callback = function(value) settings.turnRate = value end})
+tuning:Slider({Id = "error", Text = "Legit 조준 흔들림", Min = 0, Max = 0.5, Step = 0.02, Default = 0.12, Callback = function(value) settings.error = value end})
+tuning:Slider({Id = "range", Text = "탐색 거리", Min = 800, Max = 4000, Step = 100, Default = 2400, Callback = function(value) settings.range = value end})
+tuning:Label({Id = "usage", Text = "출격 후 전투 모드를 켜세요."})
+local events = game:GetService("ReplicatedStorage").Dogadjaji
+window:Give(events.Projektil.OnClientEvent:Connect(function(shooter, id, group, position, direction, target)
+	if not enabled or settings.mode ~= "Rage" or not shooter or not shooter.Parent or shooter == Damage.mojModel or typeof(position) ~= "Vector3" or typeof(direction) ~= "Vector3" or direction.Magnitude < 0.001 then return end
+	local loadout = Weapons.Naoruzanje(shooter:GetAttribute("Model"))
+	local def
+	for slot = 2, 3 do
+		for _, mount in ipairs(loadout and loadout[slot] or {}) do if mount.grupa == group then def = mount.def end end
+	end
+	if not def and type(group) == "string" and group:sub(1, 4) == "poj_" then def = Weapons.Tipovi[group] end
+	if not def or def.vrsta ~= "raketa" or def.mina then return end
+	local count, oldestKey, oldest = 0, nil, math.huge
+	for key, projectile in pairs(projectiles) do
+		count = count + 1
+		if projectile.updated < oldest then oldestKey, oldest = key, projectile.updated end
+	end
+	if count >= 64 then projectiles[oldestKey] = nil end
+	local root = roots(shooter)
+	local inherited = root and root.AssemblyLinearVelocity or Vector3.zero
+	local speed = (def.brzina or 100) + math.max(0, inherited:Dot(direction))
+	local now = os.clock()
+	projectiles[tostring(shooter) .. "_" .. tostring(id)] = {def = def, target = target, position = position, direction = direction.Unit, speed = speed, velocity = direction.Unit * speed, updated = now, expires = now + (def.zivot or 8) + 1}
+end))
+window:Give(events.ProjektilKraj.OnClientEvent:Connect(function(shooter, id)
+	projectiles[tostring(shooter) .. "_" .. tostring(id)] = nil
+end))
+window:Give(events.Pojacanje.OnClientEvent:Connect(function(action, _, kind, position, recipient)
+	if action ~= "uzeto" or recipient ~= Damage.mojModel then return end
+	if jump and jump.part and jump.kind == kind and typeof(position) == "Vector3" and (jump.position - position).Magnitude < 60 then jump = nil end
+end))
+window:Give(RunService.Heartbeat:Connect(function()
+	if destroyed or os.clock() < displayAt then return end
+	displayAt = os.clock() + 0.25
+	if enabled and (Controls.Azuriraj ~= wrapped or (settings.mode == "Rage" and FlightModel.Korak ~= wrappedStep)) then
+		stop()
+		window:Notify({Title = "자동 전투 중지", Content = "다른 스크립트가 조작 함수를 변경했습니다.", Kind = "Warning"})
+	end
+	statusLabel:SetText((enabled and settings.mode .. " 작동: " or "정지: ") .. state.mode)
+	local target = state.target and state.target.id
+	if target and target.Parent then
+		local owner = target:GetAttribute("Vlasnik")
+		local other = type(owner) == "number" and Players:GetPlayerByUserId(owner)
+		local name = other and other.DisplayName or (target.Name:match("^Bot_") and "봇 비행기" or "플레이어 비행기")
+		targetLabel:SetText("표적: " .. name .. " | " .. math.floor(state.distance) .. " 스터드")
+	else
+		targetLabel:SetText("표적 없음")
+	end
+end))
+return window
